@@ -552,3 +552,436 @@ Teacher (whisper-large-v3) → soft labels 생성 → Student (whisper-tiny) 학
 | Pseudo-labeling | 중간 | 추론 파이프라인 + 신뢰도 필터링 로직 구현 필요 |
 | Knowledge Distillation | 높음 | Teacher/Student 이중 학습 파이프라인 구성 필요 |
 | Curriculum Learning | 중간 | 데이터 난이도 분류 + 단계별 DataLoader 전환 필요 |
+
+---
+
+## Q9. `pyarrow.lib.ArrowNotImplementedError: Unsupported cast from large_string to struct` 오류가 발생하는 이유는?
+
+### A. `load_dataset("csv")` 가 문자열을 `large_string`으로 저장하지만, `Audio.cast_storage()`는 `string` 타입만 허용하기 때문이다.
+
+#### 오류 발생 위치
+
+```
+load_speechdb.py
+  ds = ds.cast_column("audio", Audio(sampling_rate=16000))
+                                ↑
+  PyArrow가 large_string → struct 직접 변환을 지원하지 않아 오류 발생
+```
+
+#### 원인
+
+`load_dataset("csv", ...)` 는 내부적으로 PyArrow를 사용하며, 문자열 컬럼을 `large_string` 타입으로 저장한다. HuggingFace `Audio` feature의 `cast_storage()`는 `string` 타입 입력만 지원하여 `large_string`을 바로 받으면 오류가 발생한다.
+
+```
+CSV 로드 → audio 컬럼 타입: large_string
+Audio.cast_storage() 요구 타입: string
+→ 직접 변환 불가 → ArrowNotImplementedError
+```
+
+#### 해결 방법
+
+`Audio`로 캐스팅하기 전에 `Value("string")`으로 먼저 다운캐스트한다.
+
+```python
+# load_speechdb.py
+from datasets import Audio, Value
+
+ds = ds.cast_column("audio", Value("string"))        # large_string → string
+ds = ds.cast_column("audio", Audio(sampling_rate=sr))  # string → Audio
+```
+
+#### 구현 위치
+
+- `load_speechdb.py`: `build_and_load_enuma_dataset_basedon_csv()` 함수 내 캐스팅 2단계로 수정
+
+---
+
+## Q10. `RuntimeError: Could not load libtorchcodec` 오류가 발생하는 이유와 해결책은?
+
+### A. `torchcodec`이 필요로 하는 FFmpeg 공유 라이브러리가 없거나 PyTorch 버전과 호환되지 않기 때문이다.
+
+#### 오류 발생 배경
+
+`datasets` 최신 버전(4.x)은 오디오 디코딩 시 기본적으로 `torchcodec`을 사용한다. `torchcodec`은 FFmpeg의 공유 라이브러리(`libavutil.so.*`)가 시스템에 설치되어 있어야 동작한다.
+
+```
+datasets Audio.decode_example()
+  └→ torchcodec.AudioDecoder
+       └→ FFmpeg 공유 라이브러리 (libavutil.so.*)
+            └→ 없으면 RuntimeError
+```
+
+#### 증상
+
+- FFmpeg 미설치 환경에서 `datasets.map()` 실행 시 발생
+- 멀티프로세싱(`num_proc > 1`) 환경에서는 워커 프로세스 내부에서 발생하여 전체 map이 실패
+
+#### 해결 방법
+
+**방법 1 — FFmpeg 설치 (근본 해결):**
+```bash
+sudo apt-get install -y ffmpeg
+```
+
+**방법 2 — torchcodec 비활성화 (FFmpeg 없이 soundfile로 폴백):**
+```bash
+pip uninstall torchcodec -y
+pip install soundfile
+```
+
+**방법 3 — 코드에서 환경변수로 비활성화:**
+```python
+# main.py 최상단
+import os
+os.environ.setdefault("DISABLE_TORCHCODEC", "1")
+```
+
+#### 구현 위치
+
+- `main.py`: `os.environ.setdefault("DISABLE_TORCHCODEC", "1")` 추가
+- `requirements.txt`: `soundfile` 추가
+
+---
+
+## Q11. `python main.py --steps prepare` 실행 중 터미널이 갑자기 죽는 이유는?
+
+### A. `num_proc` 설정이 물리 CPU 코어 수를 초과하여 Linux OOM Killer가 프로세스를 강제 종료하기 때문이다.
+
+#### 원인 분석
+
+`datasets.map(num_proc=N)`은 현재 Python 프로세스를 N개 **fork**한다. 각 fork는 부모 프로세스의 메모리를 복사하므로, 사용 메모리가 N배로 증가한다.
+
+```
+부모 프로세스 메모리 (Python + torch + 데이터셋): ~2~3 GB
+num_proc=12 → 12개 fork → 최대 ~24~36 GB 필요
+실제 가용 RAM: 12 GB → OOM → Linux가 프로세스 강제 종료
+```
+
+#### OOM Killer 동작
+
+리눅스 OOM Killer는 메모리 부족 시 가장 많은 메모리를 사용하는 프로세스를 조용히 종료한다. 별도 오류 메시지 없이 터미널이 죽는 것처럼 보인다.
+
+#### 잘못된 설정 예시
+
+```yaml
+augmentation:
+  num_proc: 12   # CPU 6코어 환경에서 12개 fork → OOM
+```
+
+#### 올바른 설정 기준
+
+| 상황 | 권장 num_proc |
+|------|--------------|
+| 메모리 여유 없음 / 소규모 데이터셋 | `1` (fork 없음, 가장 안전) |
+| 일반적인 경우 | `물리 CPU 코어 수 / 2` |
+| 메모리 여유 충분 + 대규모 데이터셋 | `물리 CPU 코어 수` 이하 |
+
+```
+note: 소규모 데이터셋(수천 개)에서는 num_proc=1이 fork 오버헤드가 없어
+      num_proc=4보다 오히려 빠른 경우가 많다.
+```
+
+#### 해결 방법
+
+```yaml
+# config.yaml
+augmentation:
+  num_proc: 1       # fork 없이 순차 처리 (메모리 안전)
+
+preprocessing:
+  num_proc: 1
+  batch_size: 16    # 한 번에 로드하는 샘플 수 축소
+```
+
+#### 구현 위치
+
+- `config.yaml`: `augmentation.num_proc: 1`, `preprocessing.num_proc: 1`, `preprocessing.batch_size: 16` 으로 수정
+
+---
+
+## Q12. GPU를 사용하려는데 `CUDA available: False` 이고 PyTorch가 GPU를 인식하지 못하는 이유는?
+
+### A. 설치된 PyTorch의 CUDA 버전이 시스템 NVIDIA 드라이버가 지원하는 CUDA 버전보다 높기 때문이다.
+
+#### 오류 메시지
+
+```
+UserWarning: CUDA initialization: The NVIDIA driver on your system is too old (found version 12020).
+RuntimeError: The NVIDIA driver on your system is too old.
+```
+
+#### 원인
+
+PyTorch는 특정 CUDA 버전용으로 컴파일된다. 설치된 PyTorch의 CUDA 버전이 드라이버가 지원하는 최대 CUDA 버전보다 높으면 GPU를 사용할 수 없다.
+
+```
+설치된 PyTorch: 2.11.0+cu130  → CUDA 13.0 필요 → 드라이버 570+ 필요
+실제 드라이버:  535.288.01    → CUDA 12.2 지원까지
+→ 버전 불일치 → CUDA available: False
+```
+
+#### NVIDIA 드라이버 버전과 지원 CUDA 버전 관계
+
+| NVIDIA 드라이버 | 지원 최대 CUDA |
+|----------------|--------------|
+| 535.x | 12.2 |
+| 550.x | 12.4 |
+| 570.x | 13.0 |
+
+> 드라이버 업데이트가 아닌 **PyTorch 재설치**가 올바른 해결책이다. 드라이버 535.x는 현재 환경(GTX 1660)에 적합한 버전이다.
+
+#### 해결 방법
+
+```bash
+# 기존 PyTorch 제거
+pip uninstall torch torchaudio torchcodec -y
+
+# 드라이버(CUDA 12.2)에 맞는 cu121 빌드로 재설치
+pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+
+# 확인
+python -c "import torch; print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0))"
+```
+
+#### 구현 위치
+
+- `requirements.txt`: `torch`, `torchaudio` cu121 빌드로 교체
+
+---
+
+## Q13. 학습 중 `ImportError: To support decoding audio data, please install 'torchcodec'` 오류가 반복되는 이유는?
+
+### A. 전처리 완료된 캐시에 `audio` 컬럼(Audio 타입)이 그대로 남아있어 DataLoader가 학습 중 오디오를 재디코딩하려 하기 때문이다.
+
+#### 오류 발생 흐름
+
+```
+trainer.train()
+  └→ DataLoader가 배치 로드
+       └→ datasets가 모든 컬럼 디코딩 시도
+            └→ audio 컬럼(Audio 타입) → torchcodec으로 디코딩
+                 └→ torchcodec 미설치 → ImportError
+```
+
+#### 원인
+
+`preprocess_datasetdict_batched(remove_others=False)` 설정으로 전처리 후에도 원본 컬럼(`audio`, `sentence`)이 캐시에 그대로 보존된다. 학습에 필요한 컬럼은 `input_features`와 `labels`뿐이지만, DataLoader는 전체 행을 읽으며 `audio` 컬럼 디코딩을 시도한다.
+
+```python
+# 전처리 후 캐시 컬럼 상태 (문제 있음)
+columns: ['audio', 'sentence', 'input_features', 'labels']
+#          ↑ Audio(decode=True) → DataLoader가 torchcodec 호출
+```
+
+#### 해결 방법
+
+**방법 1 — 학습 직전 컬럼 제거 (기존 캐시 즉시 적용):**
+
+```python
+# main.py - trainer.train() 호출 전
+drop_cols = [c for c in ["audio", "sentence"] if c in train_dataset.column_names]
+if drop_cols:
+    train_dataset = train_dataset.remove_columns(drop_cols)
+    eval_dataset  = eval_dataset.remove_columns(
+        [c for c in drop_cols if c in eval_dataset.column_names]
+    )
+```
+
+**방법 2 — 전처리 시 원본 컬럼 제거 (근본 해결, 캐시 재생성 필요):**
+
+```python
+# main.py - prepare_datasets_offline() 내부
+dsd_proc = preprocess_datasetdict_batched(
+    ...
+    remove_others=True,   # False → True 변경
+    ...
+)
+```
+
+```bash
+# 기존 전처리 캐시 삭제 후 재생성
+rm -rf storage/preprocessed_enuma_speech
+python main.py --steps prepare
+```
+
+#### 전처리 후 올바른 컬럼 구조
+
+```python
+# 학습에 필요한 컬럼만 남긴 상태
+columns: ['input_features', 'labels']
+#          ↑ log-mel 특징    ↑ 토큰 ID
+```
+
+#### 구현 위치
+
+- `main.py`: 학습 직전 `remove_columns(["audio", "sentence"])` 추가
+- `main.py`: `prepare_datasets_offline()` 에서 `remove_others=True` 로 수정
+- `storage/preprocessed_enuma_speech/`: 삭제 후 재생성
+
+---
+
+## Q14. `datasets.map(num_proc=1)`이어도 torchcodec 오류가 subprocess에서 반복되는 이유는?
+
+### A. `num_proc=1`이어도 datasets가 내부적으로 subprocess를 spawn하며, 해당 subprocess는 Python 코드에서 설정한 환경변수를 상속받지 못하기 때문이다.
+
+#### 원인
+
+```python
+os.environ.setdefault("DISABLE_TORCHCODEC", "1")  # main.py에서 설정
+```
+
+이 환경변수는 메인 프로세스에는 적용되지만, `num_proc=1`로 spawn된 worker subprocess는 `spawn` 방식으로 생성되어 런타임 환경변수를 상속받지 못한다.
+
+```
+메인 프로세스: DISABLE_TORCHCODEC=1 (설정됨)
+  └→ datasets.map(num_proc=1) → subprocess spawn
+       └→ 새 프로세스: DISABLE_TORCHCODEC 없음 → torchcodec 호출 → ImportError
+```
+
+#### num_proc 값에 따른 동작 차이
+
+| 값 | 동작 | torchcodec 문제 |
+|----|------|----------------|
+| `1` | subprocess spawn (multiprocess 사용) | 발생 |
+| `None` | 메인 프로세스에서 직접 실행 (subprocess 없음) | 발생 안 함 |
+| `2+` | N개 subprocess spawn | 발생 |
+
+#### 해결 방법
+
+`config.yaml`에서 `num_proc`을 `null`(Python의 `None`)로 설정한다.
+
+```yaml
+augmentation:
+  num_proc: null    # subprocess 없이 메인 프로세스에서 실행
+
+preprocessing:
+  num_proc: null
+```
+
+`None`으로 설정하면 `Dataset.map()`이 subprocess를 전혀 생성하지 않고 메인 프로세스에서 직접 실행하여 환경변수 상속 문제가 사라진다.
+
+#### 구현 위치
+
+- `config.yaml`: `augmentation.num_proc: null`, `preprocessing.num_proc: null` 로 수정
+
+---
+
+## Q15. `Seq2SeqTrainingArguments`에서 `unexpected keyword argument 'group_by_length'` 오류가 발생하는 이유는?
+
+### A. `transformers` 5.x에서 `group_by_length`와 `length_column_name` 파라미터가 제거됐기 때문이다.
+
+#### 오류 메시지
+
+```
+TypeError: Seq2SeqTrainingArguments.__init__() got an unexpected keyword argument 'group_by_length'
+```
+
+#### 원인
+
+`transformers 4.x`에서 존재하던 `group_by_length`, `length_column_name` 파라미터가 `5.x`에서 삭제됐다.
+
+#### 해결 방법
+
+`Seq2SeqTrainingArguments`에서 두 인자를 제거한다.
+
+```python
+# 제거 전
+training_args = Seq2SeqTrainingArguments(
+    ...
+    group_by_length=False,       # 삭제
+    length_column_name="input_length",  # 삭제
+    ...
+)
+
+# 제거 후
+training_args = Seq2SeqTrainingArguments(
+    ...
+    # 위 두 줄 없음
+    ...
+)
+```
+
+#### 구현 위치
+
+- `main.py`: `Seq2SeqTrainingArguments` 생성 시 `group_by_length`, `length_column_name` 인자 제거
+
+---
+
+## Q16. 학습 로그(`loss`, `grad_norm`, `learning_rate`, `epoch`)는 각각 무엇을 의미하는가?
+
+### A. 각 지표는 학습이 올바르게 수렴하고 있는지 판단하는 핵심 신호다.
+
+#### 실제 로그 예시
+
+```
+{'loss': '5.43',  'grad_norm': '10.02', 'learning_rate': '9.854e-05', 'epoch': '0.53'}
+{'loss': '3.626', 'grad_norm': '5.084', 'learning_rate': '8.392e-05', 'epoch': '1.05'}
+{'loss': '3.278', 'grad_norm': '5.851', 'learning_rate': '6.93e-05',  'epoch': '1.58'}
+{'loss': '3.189', 'grad_norm': '4.181', 'learning_rate': '5.468e-05', 'epoch': '2.11'}
+{'loss': '3.037', 'grad_norm': '3.243', 'learning_rate': '4.006e-05', 'epoch': '2.63'}
+{'loss': '2.995', 'grad_norm': '1.736', 'learning_rate': '2.544e-05', 'epoch': '3.16'}
+{'loss': '2.94',  'grad_norm': '1.832', 'learning_rate': '1.082e-05', 'epoch': '3.68'}
+```
+
+#### loss (손실값)
+
+모델 예측과 정답의 차이. **낮을수록 좋으며 감소 추세여야 정상이다.**
+
+```
+5.43 → 3.63 → 3.28 → 3.19 → 3.04 → 3.00 → 2.94   ← 정상 수렴
+```
+
+| 상태 | 의미 |
+|------|------|
+| 꾸준히 감소 | 정상 학습 |
+| 감소 후 증가 | 과적합 시작 |
+| 거의 변화 없음 | 학습률 너무 작음 또는 수렴 완료 |
+| 폭발적 증가 | 학습률 너무 크거나 gradient 발산 |
+
+#### grad_norm (그레이디언트 노름)
+
+파라미터 업데이트 크기. **초반에 크다가 점차 안정화되는 것이 정상이다.**
+
+```
+10.02 → 5.08 → 5.85 → 4.18 → 3.24 → 1.74 → 1.83   ← 안정화
+```
+
+`max_grad_norm: 1.0` 설정으로 gradient clipping이 적용되어 있어 `grad_norm > 1.0`이면 클리핑된 것이다. 지속적으로 매우 큰 값(20+)이 나오면 학습률을 낮춰야 한다.
+
+#### learning_rate (학습률 스케줄)
+
+Warmup 후 cosine 감쇠로 자동 조절된다.
+
+```
+학습률
+  │
+1e-4 ─┤     ╭───────╮
+      │    ╱         ╲
+      │   ╱            ╲
+      │  ╱               ╲
+  0 ──┼─╱─────────────────╲──→ step
+      ←warmup→←── cosine decay ──→
+     (10%)
+```
+
+`warmup_ratio: 0.1` → 전체 380 steps 중 처음 38 steps 동안 0 → 1e-4 로 선형 증가 후 감쇠
+
+#### epoch
+
+전체 학습 데이터를 몇 번 반복했는지.
+
+```
+1,519 샘플 ÷ 배치8 ÷ gradient_accumulation2 = 95 steps/에폭
+4 에폭 × 95 = 380 steps 총합
+```
+
+#### 학습 완료 후 생성 결과물
+
+```
+checkpoints/whisper-tiny-en/
+├── checkpoint-500/           # 500 steps 체크포인트
+├── ...
+└── (best model 자동 저장)    # eval_loss 기준 최적 모델
+```
+
+`load_best_model_at_end: true` 설정으로 학습 완료 시 가장 낮은 `eval_loss`를 기록한 체크포인트가 최종 모델로 선택된다.

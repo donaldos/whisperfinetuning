@@ -181,7 +181,7 @@ def prepare_datasets_offline(dsd: DatasetDict, cfg: dict, processor) -> DatasetD
         text_col="sentence",
         num_proc=prep_cfg.get("num_proc"),
         batch_size=prep_cfg.get("batch_size", 32),
-        remove_others=False,
+        remove_others=True,
         feature_dtype=prep_cfg.get("feature_dtype", "float32"),
         max_target_len=prep_cfg.get("max_target_len"),
         truncation=prep_cfg.get("truncation", True),
@@ -387,6 +387,16 @@ if __name__ == '__main__':
 
     # ── 3단계: 모델 초기화 및 학습 ──────────────────────────────────
     if "train" in steps:
+        # DataLoader가 학습 중 오디오를 재디코딩하지 않도록 원본 컬럼 제거
+        # (전처리 결과인 input_features, labels 만 남김)
+        drop_cols = [c for c in ["audio", "sentence"] if c in train_dataset.column_names]
+        if drop_cols:
+            train_dataset = train_dataset.remove_columns(drop_cols)
+            eval_dataset  = eval_dataset.remove_columns(
+                [c for c in drop_cols if c in eval_dataset.column_names]
+            )
+            logger.info(f"학습 전 컬럼 제거: {drop_cols}")
+
         with log_step(logger, "3단계: 모델 초기화"):
             model = setup_model(cfg, processor)
         _log_model_info(model)
@@ -429,8 +439,6 @@ if __name__ == '__main__':
             dataloader_num_workers=train_cfg.get("dataloader_num_workers", 0),
             dataloader_prefetch_factor=None,
             dataloader_persistent_workers=False,
-            group_by_length=False,
-            length_column_name="input_length",
             remove_unused_columns=False,
             fp16=train_cfg.get("fp16", True),
             seed=train_cfg.get("seed", 42),

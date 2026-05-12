@@ -25,7 +25,7 @@ data:
 augmentation:
   mode: "offline"                # "offline" (사전 생성+저장) 또는 "on_the_fly" (매 에폭 실시간)
   offline_cache_dir: "storage/augument_enuma_speech"   # offline 모드에서 증강 데이터 저장 경로
-  num_proc: 12                   # offline 증강 시 병렬 프로세스 수
+  num_proc: null                 # null = subprocess 없이 메인 프로세스에서 실행 (torchcodec 우회)
 
   speed:
     enabled: true
@@ -60,8 +60,8 @@ model:
 # --- 전처리 설정 ---
 preprocessing:
   preprocessed_cache_dir: "storage/preprocessed_enuma_speech"  # 전처리 완료 데이터 캐시 경로
-  num_proc: 4
-  batch_size: 32
+  num_proc: null
+  batch_size: 16
   feature_dtype: "float32"
   max_target_len: null           # 토큰 길이 제한 (null이면 무제한)
   truncation: true
