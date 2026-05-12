@@ -38,12 +38,17 @@ from augumented_audio import (
     make_eval_transform,
 )
 from access_whisperobj import get_tokenizer, get_processor, get_model
-from loggerinterface import get_logger
+from loggerinterface import get_logger, log_step
 from datasets import DatasetDict, load_from_disk
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 import evaluate
 
 logger = get_logger(__name__)
+
+# torchcodec은 FFmpeg 공유 라이브러리가 없거나 PyTorch 버전이 맞지 않으면
+# 오디오 디코딩 시 RuntimeError를 발생시킨다. datasets가 soundfile/torchaudio로
+# 폴백하도록 비활성화한다.
+os.environ.setdefault("DISABLE_TORCHCODEC", "1")
 
 DISK_ROOT = Path.cwd() / "storage"
 os.makedirs(DISK_ROOT, exist_ok=True)
@@ -259,6 +264,30 @@ def setup_model(cfg: dict, processor):
 # 메인 실행
 # ============================================================
 
+def _log_dataset_info(dsd: DatasetDict) -> None:
+    """DatasetDict 각 split의 샘플 수를 로깅한다."""
+    for split, ds in dsd.items():
+        logger.info(f"  {split:12s}: {len(ds):>8,} 샘플")
+
+
+def _log_model_info(model) -> None:
+    """모델 파라미터 수와 GPU 메모리 사용량을 로깅한다."""
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"  파라미터: 전체 {total/1e6:.1f}M / 학습 가능 {trainable/1e6:.1f}M")
+    try:
+        import torch
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024 ** 2
+            reserved = torch.cuda.memory_reserved() / 1024 ** 2
+            logger.info(f"  GPU 메모리: 할당 {alloc:.0f} MB / 예약 {reserved:.0f} MB"
+                        f" ({torch.cuda.get_device_name(0)})")
+        else:
+            logger.info("  GPU: 사용 불가 (CPU 모드)")
+    except ImportError:
+        pass
+
+
 if __name__ == '__main__':
     args = parse_args()
     steps = set(args.steps)
@@ -268,6 +297,13 @@ if __name__ == '__main__':
     train_cfg = cfg["training"]
     prep_cfg = cfg["preprocessing"]
     aug_mode = cfg["augmentation"]["mode"]
+
+    logger.info("=" * 60)
+    logger.info(f"실행 단계  : {' → '.join(args.steps)}")
+    logger.info(f"설정 파일  : {args.config}")
+    logger.info(f"모델       : {model_cfg['name']}")
+    logger.info(f"증강 모드  : {aug_mode}")
+    logger.info("=" * 60)
 
     # 단계 간 캐시 경로
     source = cfg["data"]["source"]
@@ -289,64 +325,78 @@ if __name__ == '__main__':
     # Tokenizer / Processor: prepare 또는 train이 포함된 경우만 로드
     tokenizer = processor = None
     if steps & {"prepare", "train"}:
-        success, tokenizer = get_tokenizer(model_cfg["name"], model_cfg["language"], model_cfg["task"])
-        if not success:
-            raise RuntimeError(f"Tokenizer 로드 실패: {tokenizer}")
-        success, processor = get_processor(model_cfg["name"], model_cfg["language"], model_cfg["task"])
-        if not success:
-            raise RuntimeError(f"Processor 로드 실패: {processor}")
-        logger.info("Tokenizer, Processor 로드 성공")
+        with log_step(logger, "Tokenizer / Processor 로드"):
+            success, tokenizer = get_tokenizer(model_cfg["name"], model_cfg["language"], model_cfg["task"])
+            if not success:
+                raise RuntimeError(f"Tokenizer 로드 실패: {tokenizer}")
+            success, processor = get_processor(model_cfg["name"], model_cfg["language"], model_cfg["task"])
+            if not success:
+                raise RuntimeError(f"Processor 로드 실패: {processor}")
 
     # ── 1단계: 데이터 로드 ──────────────────────────────────────────
     dsd = None
     if "load" in steps:
-        logger.info("[1단계] 데이터 로드")
-        dsd = load_dataset_from_config(cfg)
-        # HuggingFace source는 자동 저장이 없으므로 캐시에 저장
-        if source == "huggingface" and not raw_cache.exists():
-            dsd.save_to_disk(str(raw_cache))
-            logger.info(f"raw 캐시 저장 완료: {raw_cache}")
+        with log_step(logger, "1단계: 데이터 로드"):
+            dsd = load_dataset_from_config(cfg)
+            if source == "huggingface" and not raw_cache.exists():
+                dsd.save_to_disk(str(raw_cache))
+                logger.info(f"  raw 캐시 저장: {raw_cache}")
+        _log_dataset_info(dsd)
     elif "prepare" in steps:
         if not raw_cache.exists():
             raise FileNotFoundError(
                 f"[오류] raw 캐시가 없습니다: {raw_cache}\n"
                 "       먼저 '--steps load' 를 실행하세요."
             )
-        dsd = load_from_disk(str(raw_cache))
-        logger.info(f"[1단계 스킵] raw 캐시에서 로드: {raw_cache}")
+        with log_step(logger, "1단계 스킵: raw 캐시 로드"):
+            dsd = load_from_disk(str(raw_cache))
+            logger.info(f"  경로: {raw_cache}")
+        _log_dataset_info(dsd)
 
     # ── 2단계: 증강 + 전처리 ────────────────────────────────────────
     train_dataset = eval_dataset = None
     if "prepare" in steps:
-        logger.info(f"[2단계] 증강 + 전처리 (mode={aug_mode})")
         if aug_mode == "offline":
             if preprocessed_cache.exists():
-                dsd_proc = load_from_disk(str(preprocessed_cache))
-                logger.info(f"전처리 캐시 재사용: {preprocessed_cache}")
+                with log_step(logger, "2단계: 전처리 캐시 로드"):
+                    dsd_proc = load_from_disk(str(preprocessed_cache))
+                    logger.info(f"  경로: {preprocessed_cache}")
             else:
-                dsd_proc = prepare_datasets_offline(dsd, cfg, processor)
-                dsd_proc.save_to_disk(str(preprocessed_cache))
-                logger.info(f"전처리 완료 → 캐시 저장: {preprocessed_cache}")
+                with log_step(logger, f"2단계: 증강 + 전처리 (mode={aug_mode})"):
+                    dsd_proc = prepare_datasets_offline(dsd, cfg, processor)
+                    dsd_proc.save_to_disk(str(preprocessed_cache))
+                    logger.info(f"  전처리 캐시 저장: {preprocessed_cache}")
         else:
-            dsd_proc = prepare_datasets_on_the_fly(dsd, cfg, processor)
+            with log_step(logger, f"2단계: 증강 + 전처리 (mode={aug_mode})"):
+                dsd_proc = prepare_datasets_on_the_fly(dsd, cfg, processor)
         train_dataset = dsd_proc["train"]
         eval_dataset = dsd_proc["test"]
-        logger.info(f"데이터 준비 완료 (mode={aug_mode})")
+        _log_dataset_info(dsd_proc)
     elif "train" in steps:
         if not preprocessed_cache.exists():
             raise FileNotFoundError(
                 f"[오류] 전처리 캐시가 없습니다: {preprocessed_cache}\n"
                 "       먼저 '--steps prepare' 를 실행하세요."
             )
-        dsd_proc = load_from_disk(str(preprocessed_cache))
+        with log_step(logger, "2단계 스킵: 전처리 캐시 로드"):
+            dsd_proc = load_from_disk(str(preprocessed_cache))
+            logger.info(f"  경로: {preprocessed_cache}")
         train_dataset = dsd_proc["train"]
         eval_dataset = dsd_proc["test"]
-        logger.info(f"[2단계 스킵] 전처리 캐시에서 로드: {preprocessed_cache}")
+        _log_dataset_info(dsd_proc)
 
     # ── 3단계: 모델 초기화 및 학습 ──────────────────────────────────
     if "train" in steps:
-        logger.info("[3단계] 모델 초기화 및 학습 시작")
-        model = setup_model(cfg, processor)
+        with log_step(logger, "3단계: 모델 초기화"):
+            model = setup_model(cfg, processor)
+        _log_model_info(model)
+
+        logger.info("학습 설정:")
+        logger.info(f"  에폭          : {train_cfg['num_epochs']}")
+        logger.info(f"  배치 크기     : {train_cfg['train_batch_size']} "
+                    f"(유효: {train_cfg['train_batch_size'] * train_cfg['gradient_accumulation_steps']})")
+        logger.info(f"  학습률        : {train_cfg['learning_rate']}")
+        logger.info(f"  출력 디렉토리 : {train_cfg['output_dir']}")
 
         data_collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=processor,
@@ -396,4 +446,10 @@ if __name__ == '__main__':
             processing_class=processor,
         )
 
-        trainer.train()
+        with log_step(logger, "3단계: 학습"):
+            trainer.train()
+
+        logger.info("=" * 60)
+        logger.info("파인튜닝 완료")
+        logger.info(f"체크포인트 저장 경로: {train_cfg['output_dir']}")
+        logger.info("=" * 60)

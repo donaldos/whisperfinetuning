@@ -23,7 +23,8 @@ loggerinterface.py - 프로젝트 공통 로깅 설정 모듈
 from __future__ import annotations
 import logging
 import logging.handlers as handlers
-import os, sys
+import os, sys, time
+from contextlib import contextmanager
 from pathlib import Path
 
 # 싱글톤 플래그: 루트 로거 구성이 한 번만 실행되도록 보장
@@ -91,3 +92,22 @@ def get_logger(name: str | None = None) -> logging.Logger:
     """
     _ensure_configured()
     return logging.getLogger(name if name else "app")
+
+
+@contextmanager
+def log_step(logger: logging.Logger, name: str):
+    """단계 시작·종료와 소요 시간을 자동으로 로깅하는 컨텍스트 매니저.
+
+    사용 예:
+        with log_step(logger, "데이터 로드"):
+            dsd = load_dataset_from_config(cfg)
+    """
+    logger.info(f"[시작] {name}")
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = time.perf_counter() - t0
+        m, s = divmod(elapsed, 60)
+        duration = f"{int(m)}분 {s:.1f}초" if m else f"{s:.1f}초"
+        logger.info(f"[완료] {name} | 소요: {duration}")

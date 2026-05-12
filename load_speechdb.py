@@ -26,7 +26,7 @@ import re
 import pandas as pd
 from pathlib import Path
 from typing import Dict, List, Tuple, Literal, Optional
-from datasets import load_dataset, Audio, DatasetDict
+from datasets import load_dataset, Audio, DatasetDict, Value
 from loggerinterface import get_logger
 
 logger = get_logger(__name__)
@@ -283,8 +283,9 @@ def build_and_load_enuma_dataset_basedon_csv(root_dir: str,
     data_files = {"train": str(train_csv), "validation": str(valid_csv), "test": str(test_csv)}
     ds = load_dataset("csv", data_files=data_files, cache_dir=None)
 
-    # audio 컬럼: 문자열(파일 경로) → Audio 타입으로 캐스팅
-    # Audio 타입은 접근 시점에 wav를 디코딩하고 16kHz로 자동 리샘플링
+    # load_dataset("csv") 는 문자열을 large_string 으로 저장하는데,
+    # Audio.cast_storage() 는 string 타입만 허용하므로 먼저 다운캐스트 후 Audio 로 변환
+    ds = ds.cast_column("audio", Value("string"))
     ds = ds.cast_column("audio", Audio(sampling_rate=16000))
     return ds
 
