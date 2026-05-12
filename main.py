@@ -5,14 +5,21 @@ config.yaml을 통해 다음을 선택적으로 구성할 수 있다:
   - 데이터 소스: 로컬 파일(wav/txt) 또는 HuggingFace Hub
   - 증강 방식: offline(사전 생성+저장) 또는 on_the_fly(매 에폭 실시간)
 
-전체 파이프라인:
-  1단계: 데이터 로드 (로컬 CSV manifest 또는 HF Hub)
-  2단계: 불필요 컬럼 제거
-  3단계: 데이터 증강 (offline 또는 on-the-fly)
-  4단계: 전처리 (log-mel + 토크나이징)
-  5단계: 모델 초기화 및 학습
+전체 파이프라인 (--steps 로 단계 선택 가능):
+  load     - 데이터 로드 및 raw 캐시 저장
+  prepare  - 증강 + 전처리 (log-mel + 토크나이징) 및 전처리 캐시 저장
+  train    - 모델 초기화 및 학습
+
+사용 예시:
+  python main.py                           # 전체 실행 (기본값)
+  python main.py --steps load              # 데이터 로드 및 캐시만
+  python main.py --steps load prepare      # 전처리까지만 (학습 제외)
+  python main.py --steps prepare train     # raw 캐시 있을 때 준비+학습
+  python main.py --steps train             # 전처리 캐시 있을 때 학습만
+  python main.py --config custom.yaml      # 설정 파일 지정
 """
 
+import argparse
 import os
 from pathlib import Path
 
@@ -40,6 +47,42 @@ logger = get_logger(__name__)
 
 DISK_ROOT = Path.cwd() / "storage"
 os.makedirs(DISK_ROOT, exist_ok=True)
+
+VALID_STEPS = ["load", "prepare", "train"]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Whisper 파인튜닝 파이프라인",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "단계 설명:\n"
+            "  load     데이터 로드 및 raw 캐시 저장\n"
+            "  prepare  증강 + 전처리(log-mel, 토크나이징) 및 캐시 저장\n"
+            "  train    모델 초기화 및 학습\n"
+            "\n"
+            "예시:\n"
+            "  python main.py                          전체 실행\n"
+            "  python main.py --steps load             데이터 로드만\n"
+            "  python main.py --steps load prepare     전처리까지 (학습 제외)\n"
+            "  python main.py --steps prepare train    raw 캐시 있을 때 준비+학습\n"
+            "  python main.py --steps train            전처리 캐시 있을 때 학습만\n"
+        ),
+    )
+    parser.add_argument(
+        "--steps",
+        nargs="+",
+        choices=VALID_STEPS,
+        default=VALID_STEPS,
+        metavar="STEP",
+        help=f"실행할 단계: {' | '.join(VALID_STEPS)} (기본값: 전체 실행)",
+    )
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="설정 파일 경로 (기본값: config.yaml)",
+    )
+    return parser.parse_args()
 
 
 def make_compute_metrics(tokenizer):
@@ -217,91 +260,140 @@ def setup_model(cfg: dict, processor):
 # ============================================================
 
 if __name__ == '__main__':
-    # 설정 파일 로드
-    cfg = load_config("config.yaml")
+    args = parse_args()
+    steps = set(args.steps)
 
+    cfg = load_config(args.config)
     model_cfg = cfg["model"]
     train_cfg = cfg["training"]
-
-    # Whisper tokenizer, processor 로드
-    success, tokenizer = get_tokenizer(model_cfg["name"], model_cfg["language"], model_cfg["task"])
-    if not success:
-        raise RuntimeError(f"Tokenizer 로드 실패: {tokenizer}")
-
-    success, processor = get_processor(model_cfg["name"], model_cfg["language"], model_cfg["task"])
-    if not success:
-        raise RuntimeError(f"Processor 로드 실패: {processor}")
-    logger.info("Tokenizer, Processor 로드 성공")
-
-    # 1단계: 데이터 로드
-    dsd = load_dataset_from_config(cfg)
-
-    # 2단계: 증강 + 전처리 (config에 따라 분기)
+    prep_cfg = cfg["preprocessing"]
     aug_mode = cfg["augmentation"]["mode"]
-    if aug_mode == "offline":
-        dsd_proc = prepare_datasets_offline(dsd, cfg, processor)
+
+    # 단계 간 캐시 경로
+    source = cfg["data"]["source"]
+    raw_cache = Path(
+        cfg["data"]["local"]["raw_cache_dir"] if source == "local"
+        else cfg["data"]["huggingface"].get("raw_cache_dir", str(DISK_ROOT / "raw_hf_cache"))
+    )
+    preprocessed_cache = Path(
+        prep_cfg.get("preprocessed_cache_dir", str(DISK_ROOT / "preprocessed"))
+    )
+
+    # on_the_fly 모드에서 train 단독 실행은 불가 (transform을 디스크에 저장할 수 없음)
+    if aug_mode == "on_the_fly" and steps == {"train"}:
+        raise SystemExit(
+            "[오류] on_the_fly 모드에서는 --steps train 단독 실행이 불가합니다.\n"
+            "       prepare도 함께 지정하세요: --steps prepare train"
+        )
+
+    # Tokenizer / Processor: prepare 또는 train이 포함된 경우만 로드
+    tokenizer = processor = None
+    if steps & {"prepare", "train"}:
+        success, tokenizer = get_tokenizer(model_cfg["name"], model_cfg["language"], model_cfg["task"])
+        if not success:
+            raise RuntimeError(f"Tokenizer 로드 실패: {tokenizer}")
+        success, processor = get_processor(model_cfg["name"], model_cfg["language"], model_cfg["task"])
+        if not success:
+            raise RuntimeError(f"Processor 로드 실패: {processor}")
+        logger.info("Tokenizer, Processor 로드 성공")
+
+    # ── 1단계: 데이터 로드 ──────────────────────────────────────────
+    dsd = None
+    if "load" in steps:
+        logger.info("[1단계] 데이터 로드")
+        dsd = load_dataset_from_config(cfg)
+        # HuggingFace source는 자동 저장이 없으므로 캐시에 저장
+        if source == "huggingface" and not raw_cache.exists():
+            dsd.save_to_disk(str(raw_cache))
+            logger.info(f"raw 캐시 저장 완료: {raw_cache}")
+    elif "prepare" in steps:
+        if not raw_cache.exists():
+            raise FileNotFoundError(
+                f"[오류] raw 캐시가 없습니다: {raw_cache}\n"
+                "       먼저 '--steps load' 를 실행하세요."
+            )
+        dsd = load_from_disk(str(raw_cache))
+        logger.info(f"[1단계 스킵] raw 캐시에서 로드: {raw_cache}")
+
+    # ── 2단계: 증강 + 전처리 ────────────────────────────────────────
+    train_dataset = eval_dataset = None
+    if "prepare" in steps:
+        logger.info(f"[2단계] 증강 + 전처리 (mode={aug_mode})")
+        if aug_mode == "offline":
+            if preprocessed_cache.exists():
+                dsd_proc = load_from_disk(str(preprocessed_cache))
+                logger.info(f"전처리 캐시 재사용: {preprocessed_cache}")
+            else:
+                dsd_proc = prepare_datasets_offline(dsd, cfg, processor)
+                dsd_proc.save_to_disk(str(preprocessed_cache))
+                logger.info(f"전처리 완료 → 캐시 저장: {preprocessed_cache}")
+        else:
+            dsd_proc = prepare_datasets_on_the_fly(dsd, cfg, processor)
         train_dataset = dsd_proc["train"]
         eval_dataset = dsd_proc["test"]
-    elif aug_mode == "on_the_fly":
-        dsd_proc = prepare_datasets_on_the_fly(dsd, cfg, processor)
+        logger.info(f"데이터 준비 완료 (mode={aug_mode})")
+    elif "train" in steps:
+        if not preprocessed_cache.exists():
+            raise FileNotFoundError(
+                f"[오류] 전처리 캐시가 없습니다: {preprocessed_cache}\n"
+                "       먼저 '--steps prepare' 를 실행하세요."
+            )
+        dsd_proc = load_from_disk(str(preprocessed_cache))
         train_dataset = dsd_proc["train"]
         eval_dataset = dsd_proc["test"]
+        logger.info(f"[2단계 스킵] 전처리 캐시에서 로드: {preprocessed_cache}")
 
-    logger.info(f"데이터 준비 완료 (mode={aug_mode})")
+    # ── 3단계: 모델 초기화 및 학습 ──────────────────────────────────
+    if "train" in steps:
+        logger.info("[3단계] 모델 초기화 및 학습 시작")
+        model = setup_model(cfg, processor)
 
-    # 3단계: 모델 초기화
-    model = setup_model(cfg, processor)
+        data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+            processor=processor,
+            decoder_start_token_id=model.config.decoder_start_token_id,
+        )
 
-    # DataCollator
-    data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-        processor=processor,
-        decoder_start_token_id=model.config.decoder_start_token_id,
-    )
+        training_args = Seq2SeqTrainingArguments(
+            output_dir=train_cfg["output_dir"],
+            num_train_epochs=train_cfg["num_epochs"],
+            per_device_train_batch_size=train_cfg["train_batch_size"],
+            per_device_eval_batch_size=train_cfg["eval_batch_size"],
+            gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
+            max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
+            learning_rate=train_cfg["learning_rate"],
+            warmup_ratio=train_cfg["warmup_ratio"],
+            weight_decay=train_cfg["weight_decay"],
+            label_smoothing_factor=train_cfg["label_smoothing_factor"],
+            eval_strategy="steps",
+            eval_steps=train_cfg["eval_steps"],
+            save_strategy="steps",
+            save_steps=train_cfg["save_steps"],
+            save_total_limit=train_cfg["save_total_limit"],
+            logging_strategy="steps",
+            logging_steps=train_cfg["logging_steps"],
+            report_to=["tensorboard"],
+            load_best_model_at_end=True,
+            metric_for_best_model="eval_loss",
+            greater_is_better=False,
+            predict_with_generate=True,
+            dataloader_num_workers=train_cfg.get("dataloader_num_workers", 0),
+            dataloader_prefetch_factor=None,
+            dataloader_persistent_workers=False,
+            group_by_length=False,
+            length_column_name="input_length",
+            remove_unused_columns=False,
+            fp16=train_cfg.get("fp16", True),
+            seed=train_cfg.get("seed", 42),
+        )
 
-    # 4단계: 학습 설정
-    training_args = Seq2SeqTrainingArguments(
-        output_dir=train_cfg["output_dir"],
-        num_train_epochs=train_cfg["num_epochs"],
-        per_device_train_batch_size=train_cfg["train_batch_size"],
-        per_device_eval_batch_size=train_cfg["eval_batch_size"],
-        gradient_accumulation_steps=train_cfg["gradient_accumulation_steps"],
-        max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
-        learning_rate=train_cfg["learning_rate"],
-        warmup_ratio=train_cfg["warmup_ratio"],
-        weight_decay=train_cfg["weight_decay"],
-        label_smoothing_factor=train_cfg["label_smoothing_factor"],
-        eval_strategy="steps",
-        eval_steps=train_cfg["eval_steps"],
-        save_strategy="steps",
-        save_steps=train_cfg["save_steps"],
-        save_total_limit=train_cfg["save_total_limit"],
-        logging_strategy="steps",
-        logging_steps=train_cfg["logging_steps"],
-        report_to=["tensorboard"],
-        load_best_model_at_end=True,
-        metric_for_best_model="eval_loss",
-        greater_is_better=False,
-        predict_with_generate=True,
-        dataloader_num_workers=train_cfg.get("dataloader_num_workers", 0),
-        dataloader_prefetch_factor=None,
-        dataloader_persistent_workers=False,
-        group_by_length=False,
-        length_column_name="input_length",
-        remove_unused_columns=False,
-        fp16=train_cfg.get("fp16", True),
-        seed=train_cfg.get("seed", 42),
-    )
+        trainer = Seq2SeqTrainer(
+            args=training_args,
+            model=model,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            data_collator=data_collator,
+            compute_metrics=make_compute_metrics(tokenizer),
+            processing_class=processor,
+        )
 
-    # 5단계: Trainer 구성 및 학습 실행
-    trainer = Seq2SeqTrainer(
-        args=training_args,
-        model=model,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        compute_metrics=make_compute_metrics(tokenizer),
-        processing_class=processor,
-    )
-
-    logger.info("학습 시작")
-    trainer.train()
+        trainer.train()

@@ -107,6 +107,42 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### 단계별 실행 옵션 (`--steps`)
+
+파이프라인을 세 단계로 나눠 선택적으로 실행할 수 있습니다.
+
+| 단계 | 이름 | 설명 | 캐시 저장 경로 |
+|------|------|------|----------------|
+| 1 | `load` | 데이터 로드 | `raw_cache_dir` |
+| 2 | `prepare` | 증강 + 전처리(log-mel, 토크나이징) | `preprocessed_cache_dir` |
+| 3 | `train` | 모델 초기화 및 학습 | `training.output_dir` |
+
+```bash
+python main.py                          # 전체 실행 (기본값)
+python main.py --steps load             # 1단계만: 데이터 로드 및 캐시 저장
+python main.py --steps load prepare     # 1~2단계: 전처리까지 (학습 제외)
+python main.py --steps prepare train    # 2~3단계: raw 캐시 있을 때 준비+학습
+python main.py --steps train            # 3단계만: 전처리 캐시 있을 때 학습만
+python main.py --config custom.yaml     # 다른 설정 파일 지정
+```
+
+> **참고**
+> - 단계를 건너뛰면 이전 단계의 캐시가 반드시 존재해야 합니다. 없으면 오류가 발생합니다.
+> - `on_the_fly` 증강 모드에서는 `--steps train` 단독 실행이 불가합니다 (transform을 디스크에 저장할 수 없음). `--steps prepare train`으로 함께 실행하세요.
+
+캐시 경로는 `config.yaml`에서 설정합니다:
+
+```yaml
+data:
+  local:
+    raw_cache_dir: "storage/raw_enuma_speech"       # 1단계 캐시
+  huggingface:
+    raw_cache_dir: "storage/raw_hf_cache"           # HF 소스일 때 1단계 캐시
+
+preprocessing:
+  preprocessed_cache_dir: "storage/preprocessed_enuma_speech"  # 2단계 캐시
+```
+
 ### 주요 학습 설정 (config.yaml)
 
 | 항목 | 기본값 |

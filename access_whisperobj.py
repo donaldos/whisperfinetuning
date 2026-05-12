@@ -12,7 +12,6 @@ Hugging Face Hub에서 Whisper의 주요 구성 요소를 로드하는 유틸리
 
 from typing import Optional, Tuple, Union
 from transformers import (
-    WhisperConfig,
     PreTrainedTokenizerBase,
     WhisperFeatureExtractor,
     WhisperTokenizer,
@@ -118,19 +117,20 @@ def get_processor(modelsname: str, langcode: str, task: str) -> Tuple[bool, Unio
 
 def get_model(model_name: str):
     """
-    Whisper 모델을 초기화한다.
+    Whisper 사전학습 모델을 로드한다.
 
-    주의: 사전학습 가중치를 로드하지 않고, config만으로 랜덤 초기화된 모델을 생성한다.
-    사전학습 가중치를 사용하려면 WhisperForConditionalGeneration.from_pretrained()를 사용해야 한다.
+    HuggingFace Hub 모델 ID 또는 로컬 경로(model/<name>/)를 모두 지원한다.
+    download_model.py로 미리 다운로드한 경우 로컬 경로를 config.yaml에 지정하면
+    오프라인 환경에서도 사용할 수 있다.
 
     Args:
-        model_name: Hugging Face Hub 모델 ID (config 구조를 가져올 모델)
+        model_name: HuggingFace 모델 ID (예: "openai/whisper-tiny") 또는
+                    로컬 경로 (예: "model/whisper-tiny")
 
     Returns:
-        WhisperForConditionalGeneration: 랜덤 초기화된 Whisper 모델
+        WhisperForConditionalGeneration: 사전학습 가중치가 로드된 Whisper 모델
     """
-    cfg = WhisperConfig.from_pretrained(model_name)
-    return WhisperForConditionalGeneration(cfg)
+    return WhisperForConditionalGeneration.from_pretrained(model_name)
 
 
 def get_trainer_args(argfilepath: str):
