@@ -1,3 +1,15 @@
+"""
+access_whisperobj.py - Whisper 모델 관련 객체 로더
+
+Hugging Face Hub에서 Whisper의 주요 구성 요소를 로드하는 유틸리티 모듈.
+  - FeatureExtractor: 원시 오디오 → log-mel spectrogram 변환
+  - Tokenizer: 텍스트 ↔ 토큰 ID 변환
+  - Processor: FeatureExtractor + Tokenizer를 통합한 객체
+  - Model: Whisper 조건부 생성 모델 (WhisperForConditionalGeneration)
+
+모든 로더 함수는 예외를 내부에서 처리하여 (성공여부, 결과) 튜플을 반환한다.
+"""
+
 from typing import Optional, Tuple, Union
 from transformers import (
     WhisperConfig,
@@ -14,7 +26,20 @@ from transformers import HfArgumentParser, Seq2SeqTrainingArguments
 from loggerinterface import get_logger
 logger = get_logger(__name__)
 
+
 def get_feature_extractor(modelsname: str) -> Optional[WhisperFeatureExtractor]:
+    """
+    Whisper FeatureExtractor를 로드한다.
+
+    FeatureExtractor는 원시 오디오 파형(waveform)을 모델이 이해할 수 있는
+    80채널 log-mel spectrogram으로 변환하는 역할을 한다.
+
+    Args:
+        modelsname: Hugging Face Hub 모델 ID (예: "openai/whisper-tiny")
+
+    Returns:
+        성공 시 WhisperFeatureExtractor, 실패 시 None
+    """
     try:
         return WhisperFeatureExtractor.from_pretrained(modelsname)
     except Exception as e:
@@ -26,13 +51,14 @@ def get_tokenizer(modelsname: str, langcode: str, task: str) -> Tuple[bool, Unio
     """
     지정한 Whisper 모델로부터 토크나이저(WhisperTokenizer)를 로드하는 함수.
 
-    WhisperTokenizer는 Whisper 모델이 텍스트를 처리할 수 있도록 
-    문자열을 토큰 ID로 변환하는 역할을 합니다.
+    WhisperTokenizer는 Whisper 모델이 텍스트를 처리할 수 있도록
+    문자열을 토큰 ID로 변환하는 역할을 한다.
+    언어 코드와 태스크에 따라 특수 토큰(<|en|>, <|transcribe|> 등)이 자동 설정된다.
 
     Args:
-        modelsname (str): Hugging Face 모델 이름 (예: "openai/whisper-small")
-        langcode (str): 사용할 언어 코드 (예: "en", "ko", "ja", "fr" 등)
-        task (str): Whisper의 작업 모드 ("transcribe" 또는 "translate")
+        modelsname: Hugging Face 모델 이름 (예: "openai/whisper-small")
+        langcode: 사용할 언어 코드 (예: "en", "ko", "ja", "fr" 등)
+        task: Whisper의 작업 모드 ("transcribe" 또는 "translate")
 
     Returns:
         Tuple[bool, Union[WhisperTokenizer, str]]:
@@ -46,7 +72,6 @@ def get_tokenizer(modelsname: str, langcode: str, task: str) -> Tuple[bool, Unio
         ...     print(ids)
     """
     try:
-        # 지정한 모델에서 WhisperTokenizer 로드
         tokenizer = WhisperTokenizer.from_pretrained(
             modelsname,
             language=langcode,
@@ -55,7 +80,6 @@ def get_tokenizer(modelsname: str, langcode: str, task: str) -> Tuple[bool, Unio
         return True, tokenizer
 
     except Exception as e:
-        # 로드 중 예외 발생 시 False와 오류 메시지 반환
         return False, f"{e}"
 
 
@@ -63,14 +87,15 @@ def get_processor(modelsname: str, langcode: str, task: str) -> Tuple[bool, Unio
     """
     지정한 Whisper 모델로부터 WhisperProcessor를 로드하는 함수.
 
-    WhisperProcessor는 Whisper 모델에서 오디오 전처리(feature extraction)와 
-    텍스트 토크나이징(tokenization)을 모두 담당하는 통합 객체입니다.
-    즉, Whisper 모델의 입력과 출력을 함께 관리할 수 있습니다.
+    WhisperProcessor는 내부적으로 WhisperFeatureExtractor와 WhisperTokenizer를
+    모두 포함하는 통합 객체이다.
+      - 입력 처리: 오디오 파형 → log-mel spectrogram (FeatureExtractor)
+      - 출력 처리: 텍스트 → 토큰 ID / 토큰 ID → 텍스트 (Tokenizer)
 
     Args:
-        modelsname (str): Hugging Face Hub 모델 이름 (예: "openai/whisper-small")
-        language (str): Whisper 모델이 사용할 언어 코드 (예: "en", "ko", "ja")
-        task (str): 작업 유형 ("transcribe" 또는 "translate")
+        modelsname: Hugging Face Hub 모델 이름 (예: "openai/whisper-small")
+        langcode: Whisper 모델이 사용할 언어 코드 (예: "en", "ko", "ja")
+        task: 작업 유형 ("transcribe" 또는 "translate")
 
     Returns:
         Tuple[bool, Union[WhisperProcessor, str]]:
@@ -84,18 +109,39 @@ def get_processor(modelsname: str, langcode: str, task: str) -> Tuple[bool, Unio
         ...     print(inputs.input_features.shape)
     """
     try:
-        # Hugging Face Hub 또는 로컬 캐시에서 WhisperProcessor 로드
         proc = WhisperProcessor.from_pretrained(modelsname, language=langcode, task=task)
         return True, proc
 
     except Exception as e:
-        # 로드 실패 시 오류 메시지 반환
         return False, f"{e}"
-    
-def get_model(model_name:str):
+
+
+def get_model(model_name: str):
+    """
+    Whisper 모델을 초기화한다.
+
+    주의: 사전학습 가중치를 로드하지 않고, config만으로 랜덤 초기화된 모델을 생성한다.
+    사전학습 가중치를 사용하려면 WhisperForConditionalGeneration.from_pretrained()를 사용해야 한다.
+
+    Args:
+        model_name: Hugging Face Hub 모델 ID (config 구조를 가져올 모델)
+
+    Returns:
+        WhisperForConditionalGeneration: 랜덤 초기화된 Whisper 모델
+    """
     cfg = WhisperConfig.from_pretrained(model_name)
     return WhisperForConditionalGeneration(cfg)
 
+
 def get_trainer_args(argfilepath: str):
+    """
+    JSON 파일로부터 Seq2SeqTrainingArguments를 파싱한다.
+
+    HfArgumentParser를 사용하여 JSON 형태의 학습 설정 파일을 읽고,
+    Seq2SeqTrainingArguments 객체로 변환한다.
+
+    Args:
+        argfilepath: 학습 인자가 저장된 JSON 파일 경로
+    """
     parser = HfArgumentParser(Seq2SeqTrainingArguments)
     (training_args,) = parser.parse_json_file(json_file=argfilepath)

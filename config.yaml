@@ -1,0 +1,85 @@
+# ============================================================
+# Whisper Fine-Tuning 설정 파일
+# ============================================================
+
+# --- 데이터 소스 설정 ---
+data:
+  source: "local"                # "local" (로컬 wav/txt) 또는 "huggingface" (HF Hub)
+
+  # source: "local" 일 때 사용
+  local:
+    db_path: "storage/EnumaSpeech_01"
+    raw_cache_dir: "storage/raw_enuma_speech"
+    sampling_rate: 16000
+
+  # source: "huggingface" 일 때 사용
+  huggingface:
+    dataset_id: "mozilla-foundation/common_voice_17_0"
+    subset: "en"                 # 데이터셋 서브셋 (없으면 null)
+    audio_column: "audio"        # 오디오 컬럼명 (데이터셋마다 다를 수 있음)
+    text_column: "sentence"      # 전사 텍스트 컬럼명
+    sampling_rate: 16000
+
+# --- 데이터 증강 설정 ---
+augmentation:
+  mode: "offline"                # "offline" (사전 생성+저장) 또는 "on_the_fly" (매 에폭 실시간)
+  offline_cache_dir: "storage/augument_enuma_speech"   # offline 모드에서 증강 데이터 저장 경로
+  num_proc: 12                   # offline 증강 시 병렬 프로세스 수
+
+  speed:
+    enabled: true
+    prob: 0.5
+    min_speed: 0.9
+    max_speed: 1.1
+
+  volume:
+    enabled: true
+    prob: 0.5
+    min_gain_db: -6.0
+    max_gain_db: 6.0
+
+  noise:
+    enabled: true
+    prob: 0.5
+    noise_dir: "/path/to/noise_wavs"
+    min_snr_db: 5.0
+    max_snr_db: 20.0
+
+  reverb:
+    enabled: false               # true로 변경하면 RIR 기반 잔향 증강 활성화
+    prob: 0.3                    # 적용 확률 (잔향은 과도하면 인식률 저하 → 0.2~0.4 권장)
+    rir_dir: "/path/to/rir_wavs" # RIR wav 파일 디렉토리 (OpenSLR-28 등)
+
+# --- 모델 설정 ---
+model:
+  name: "openai/whisper-tiny"
+  language: "en"
+  task: "transcribe"
+
+# --- 전처리 설정 ---
+preprocessing:
+  num_proc: 4
+  batch_size: 32
+  feature_dtype: "float32"
+  max_target_len: null           # 토큰 길이 제한 (null이면 무제한)
+  truncation: true
+
+# --- 학습 설정 ---
+training:
+  output_dir: "./checkpoints/whisper-tiny-en"
+  num_epochs: 4
+  train_batch_size: 8
+  eval_batch_size: 8
+  gradient_accumulation_steps: 2
+  max_grad_norm: 1.0
+  learning_rate: 1.0e-4
+  warmup_ratio: 0.1
+  weight_decay: 0.01
+  label_smoothing_factor: 0.1
+  eval_steps: 500
+  save_steps: 500
+  save_total_limit: 3
+  logging_steps: 50
+  fp16: true
+  seed: 42
+  dataloader_num_workers: 0
