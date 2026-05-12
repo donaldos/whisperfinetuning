@@ -7,13 +7,14 @@ Hugging Face `transformers`와 `datasets` 라이브러리 기반으로 구성되
 
 - **데이터 소스 선택**: 로컬 음성 파일(wav/txt) 또는 HuggingFace Hub 데이터셋
 - **증강 방식 선택**: 오프라인(사전 생성) 또는 On-the-fly(실시간 랜덤 증강)
+- **단계별 실행**: `--steps` 옵션으로 파이프라인 일부만 선택 실행
+- **로컬 모델 지원**: `download_model.py`로 사전 다운로드 후 오프라인 학습
 - **config.yaml 기반**: 모든 설정을 하나의 파일에서 관리
 
 ## 파이프라인 개요
 
 ```
 데이터 로드 (로컬 or HF Hub)
-  → 불필요 컬럼 제거
   → 데이터 증강 (offline or on-the-fly)
   → 전처리 (log-mel + 토크나이징)
   → Seq2Seq 학습 (WER 평가)
@@ -25,15 +26,52 @@ Hugging Face `transformers`와 `datasets` 라이브러리 기반으로 구성되
 whisperfinetuning/
 ├── config.yaml                      # 전체 설정 파일 (데이터 소스, 증강 방식, 학습 파라미터)
 ├── config_loader.py                 # YAML 설정 로더 및 검증
-├── main.py                          # 학습 진입점 (설정 기반 파이프라인)
+├── main.py                          # 학습 진입점 (--steps 옵션으로 단계 선택 가능)
+├── download_model.py                # Whisper 모델 로컬 다운로드
 ├── load_speechdb.py                 # 데이터 로더 (로컬 CSV manifest + HF Hub)
 ├── augumented_audio.py              # 오디오 증강 (offline + on-the-fly)
 ├── preprocess_datasetdict_batch.py  # 필터링, 전처리, DataCollator
 ├── access_whisperobj.py             # Whisper tokenizer, processor, model 로드
 ├── loggerinterface.py               # 로깅 설정 (콘솔 + 로테이팅 파일)
-├── requirements.txt                 # Python 의존성
+├── requirements.txt                 # Python 직접 의존성 (9개)
+├── .gitignore                       # Git 제외 목록
 ├── Q&A.md                           # 설계 의사결정 Q&A
-└── storage/                         # 데이터셋 캐시 디렉토리
+├── model/                           # 로컬 모델 저장 디렉토리 (.gitignore 제외)
+└── storage/                         # 데이터셋 캐시 디렉토리 (.gitignore 제외)
+```
+
+## 설치 및 준비
+
+### 1. 의존성 설치
+
+```bash
+pip install -r requirements.txt
+```
+
+의존 패키지: `torch`, `torchaudio`, `transformers`, `datasets`, `evaluate`, `numpy`, `pandas`, `pyarrow`, `PyYAML`
+
+### 2. 모델 다운로드
+
+```bash
+python download_model.py
+```
+
+`model/whisper-tiny/` 폴더에 가중치와 tokenizer 파일을 저장합니다.  
+PyTorch 없이도 동작하며 (`huggingface_hub` 사용), 약 293MB가 필요합니다.
+
+```bash
+# 다른 모델 지정
+python download_model.py --model openai/whisper-small
+
+# 재다운로드 (덮어쓰기)
+python download_model.py --force
+```
+
+다운로드 후 `config.yaml`에서 로컬 경로로 전환하면 오프라인 학습이 가능합니다:
+
+```yaml
+model:
+  name: "model/whisper-tiny"
 ```
 
 ## 설정 (config.yaml)
@@ -46,10 +84,11 @@ data:
 
   local:
     db_path: "storage/EnumaSpeech_01"
-    raw_cache_dir: "storage/raw_enuma_speech"
+    raw_cache_dir: "storage/raw_enuma_speech"   # 1단계 캐시 경로
     sampling_rate: 16000
 
   huggingface:
+    raw_cache_dir: "storage/raw_hf_cache"       # HF 소스일 때 1단계 캐시 경로
     dataset_id: "mozilla-foundation/common_voice_17_0"
     subset: "en"
     audio_column: "audio"
@@ -80,6 +119,16 @@ augmentation:
 | `offline` | 증강을 1회 적용 후 디스크 저장 | 빠른 학습 속도 | 고정된 증강, 디스크 2배 |
 | `on_the_fly` | 매 에폭 실시간 증강 | 다양한 변형, 디스크 절약 | 약간 느린 데이터 로딩 |
 
+### 전처리 캐시 경로
+
+```yaml
+preprocessing:
+  preprocessed_cache_dir: "storage/preprocessed_enuma_speech"  # 2단계 캐시 경로
+  num_proc: 4
+  batch_size: 32
+  feature_dtype: "float32"
+```
+
 ## 데이터셋 구조 (로컬 모드)
 
 `storage/EnumaSpeech_01/` 하위에 다음 디렉토리가 필요합니다:
@@ -93,21 +142,15 @@ EnumaSpeech_01/
 
 전사 파일(.txt) 포맷: `<speaker-chapter-utt> <transcription>` (한 줄에 하나씩)
 
-## 설치
-
-```bash
-pip install -r requirements.txt
-```
-
-주요 의존성: `torch`, `transformers`, `datasets`, `torchaudio`, `evaluate`, `PyYAML`
-
 ## 실행
+
+### 전체 실행
 
 ```bash
 python main.py
 ```
 
-### 단계별 실행 옵션 (`--steps`)
+### 단계별 실행 (`--steps`)
 
 파이프라인을 세 단계로 나눠 선택적으로 실행할 수 있습니다.
 
@@ -129,19 +172,6 @@ python main.py --config custom.yaml     # 다른 설정 파일 지정
 > **참고**
 > - 단계를 건너뛰면 이전 단계의 캐시가 반드시 존재해야 합니다. 없으면 오류가 발생합니다.
 > - `on_the_fly` 증강 모드에서는 `--steps train` 단독 실행이 불가합니다 (transform을 디스크에 저장할 수 없음). `--steps prepare train`으로 함께 실행하세요.
-
-캐시 경로는 `config.yaml`에서 설정합니다:
-
-```yaml
-data:
-  local:
-    raw_cache_dir: "storage/raw_enuma_speech"       # 1단계 캐시
-  huggingface:
-    raw_cache_dir: "storage/raw_hf_cache"           # HF 소스일 때 1단계 캐시
-
-preprocessing:
-  preprocessed_cache_dir: "storage/preprocessed_enuma_speech"  # 2단계 캐시
-```
 
 ### 주요 학습 설정 (config.yaml)
 
