@@ -242,16 +242,18 @@ def setup_model(cfg: dict, processor):
     model = get_model(model_cfg["name"])
 
     # 추론/평가 시 디코더 설정
+    # forced_decoder_ids는 generate()가 내부에서도 생성하므로 중복 경고 방지를 위해 None으로 설정
     model.generation_config.language = model_cfg["language"]
     model.generation_config.task = model_cfg["task"]
-    model.generation_config.forced_decoder_idx = processor.get_decoder_prompt_ids(
-        language=model_cfg["language"], task=model_cfg["task"]
-    )
+    model.generation_config.forced_decoder_ids = None
 
-    # pad_token 설정
+    # pad_token: EOS와 동일하면 attention_mask 경고 발생 → 별도 pad_token_id 지정
     tok = processor.tokenizer
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    tok.pad_token = "<|endoftext|>"
+    model.config.pad_token_id = tok.pad_token_id
+
+    # BPE tokenizer는 clean_up_tokenization_spaces=False 필요
+    tok.clean_up_tokenization_spaces = False
 
     # decoder_start_token_id 설정
     sot_id = tok.convert_tokens_to_ids("<|startoftranscript|>")
@@ -370,7 +372,7 @@ if __name__ == '__main__':
             with log_step(logger, f"2단계: 증강 + 전처리 (mode={aug_mode})"):
                 dsd_proc = prepare_datasets_on_the_fly(dsd, cfg, processor)
         train_dataset = dsd_proc["train"]
-        eval_dataset = dsd_proc["test"]
+        eval_dataset = dsd_proc["validation"]
         _log_dataset_info(dsd_proc)
     elif "train" in steps:
         if not preprocessed_cache.exists():
@@ -382,7 +384,7 @@ if __name__ == '__main__':
             dsd_proc = load_from_disk(str(preprocessed_cache))
             logger.info(f"  경로: {preprocessed_cache}")
         train_dataset = dsd_proc["train"]
-        eval_dataset = dsd_proc["test"]
+        eval_dataset = dsd_proc["validation"]
         _log_dataset_info(dsd_proc)
 
     # ── 3단계: 모델 초기화 및 학습 ──────────────────────────────────
