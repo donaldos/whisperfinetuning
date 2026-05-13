@@ -1080,3 +1080,67 @@ training:
 #### 구현 위치
 
 - `config.yaml`: `metric_for_best_model: "eval_wer"` 로 수정
+
+---
+
+## Q18. `num_epochs`, `train_batch_size`, `gradient_accumulation_steps`의 관계는?
+
+### A. 세 파라미터가 결합되어 실제 가중치 업데이트 횟수(총 optimizer steps)가 결정된다.
+
+#### 기본 개념
+
+```yaml
+training:
+  num_epochs: 8           # 전체 데이터를 8회 반복
+  train_batch_size: 8     # 1회 순전파에 투입되는 샘플 수
+  gradient_accumulation_steps: 2  # N회 순전파 후 1회 가중치 업데이트
+```
+
+| 개념 | 설명 |
+|------|------|
+| **1 epoch** | 훈련 데이터 전체(10,000개)를 1회 완전히 학습 |
+| **8 epochs** | 훈련 데이터 전체를 8회 반복 학습 |
+| **train_batch_size=8** | 매 순전파마다 8개 샘플을 묶어 모델에 투입 |
+
+#### 전체 학습 흐름
+
+```
+훈련 데이터 10,000개, batch=8, gradient_accumulation=2
+
+1 에폭:
+  10,000 ÷ 8 = 1,250번 순전파(forward pass)
+  1,250 ÷ 2  =   625번 가중치 업데이트(optimizer step)
+
+8 에폭 전체:
+  1,250 × 8 = 10,000번 순전파
+    625 × 8 =  5,000번 가중치 업데이트
+```
+
+#### gradient_accumulation의 역할
+
+GPU 메모리가 부족할 때 큰 배치를 여러 번에 나눠 처리하면서도 효과는 큰 배치와 동일하게 만드는 기법이다.
+
+```
+[batch 1: 8개] → gradient 계산 → 저장
+[batch 2: 8개] → gradient 계산 → 누적
+                                  ↓
+                          가중치 1회 업데이트
+                     (유효 배치 = 8 × 2 = 16개 효과)
+```
+
+```
+직접 batch 16으로 학습  ≈  batch 8 + gradient_accumulation 2
+(메모리 16개 필요)           (메모리 8개만 필요, 효과는 동일)
+```
+
+#### 요약표
+
+| 설정 | 값 | 의미 |
+|------|-----|------|
+| 훈련 데이터 | 10,000개 | 1에폭당 전체 사용 |
+| `num_epochs` | 8 | 전체 데이터 8회 반복 |
+| `train_batch_size` | 8 | 1회 순전파 투입 샘플 수 |
+| `gradient_accumulation_steps` | 2 | 2회 순전파 후 1회 가중치 업데이트 |
+| **유효 배치 크기** | **16** | 실질적 학습 단위 (8 × 2) |
+| 총 순전파 횟수 | 10,000회 | num_epochs × (데이터 수 ÷ batch) |
+| 총 optimizer steps | 5,000회 | 실제 가중치 업데이트 횟수 |
