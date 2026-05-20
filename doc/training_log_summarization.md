@@ -43,6 +43,50 @@
 
 ---
 
+### eval_steps와 eval_loss 이해
+
+#### 평가에 사용되는 데이터
+
+`eval_steps=95`마다 수행되는 평가는 **validation 데이터셋**을 사용한다. HuggingFace `Trainer`는 train/eval 데이터셋을 분리해서 관리하며, 평가 시점에는 **weight 업데이트 없이** eval_dataset 전체를 forward pass만 수행한다.
+
+```python
+trainer = Trainer(
+    train_dataset=train_dataset,   # 학습에만 사용
+    eval_dataset=eval_dataset,     # eval_steps마다 사용 (weight 업데이트 없음)
+)
+```
+
+#### eval_loss의 의미
+
+**eval_loss = validation 데이터셋에 대한 평균 Cross-Entropy Loss**
+
+```
+eval_loss = -1/N × Σ log P(정답 토큰 | 이전 토큰들, 음성)
+```
+
+| 구분 | 설명 |
+|---|---|
+| **train_loss** | 현재 학습 배치의 loss (weight 업데이트에 사용) |
+| **eval_loss** | 학습에 쓰이지 않은 데이터에 대한 loss (일반화 성능 지표) |
+
+#### eval_loss로 과적합 판단
+
+```
+train_loss ↓↓  eval_loss ↓↓          → 정상 학습
+train_loss ↓↓  eval_loss → 또는 ↑    → 과적합 시작 신호
+```
+
+이번 학습에서 epoch 8이 정확히 이 패턴을 보였다:
+
+| Epoch | train_loss | eval_loss | eval_wer |
+|---|---|---|---|
+| 7 | 3.494 | 1.727 | **26.12%** ← best |
+| 8 | 3.489 ↓ | 1.726 ↓ | 26.27% ↑ ← **과적합** |
+
+> eval_loss 자체는 미세하게 계속 줄었지만 실제 지표인 eval_wer가 반등했다. 이는 loss 감소가 실제 음성 인식 성능 개선으로 이어지지 않는 과적합 초기 단계임을 의미한다. **`load_best_model_at_end=True` 설정 시 eval_loss 또는 eval_wer 기준으로 best 체크포인트를 자동 선택**하므로, `metric_for_best_model: eval_wer` 명시를 권장한다.
+
+---
+
 ## 3. 학습 메트릭 (Training Loss) 추이
 
 | 시점 | epoch | train_loss | grad_norm | learning_rate |
@@ -64,6 +108,39 @@
 | step ~750 | 7.90 | 3.489 | 1.69 | **2.05e-06** (lr 최저점) |
 
 **최종 train_loss: 3.979** (전체 평균)
+
+### 메트릭 개념 정리
+
+#### train_loss
+
+**현재 학습 배치에서 모델 예측이 정답과 얼마나 다른지를 나타내는 값**
+
+```
+train_loss = -1/N × Σ log P(정답 토큰 | 모델 예측)
+```
+
+- 값이 작을수록 현재 배치를 잘 맞추고 있다는 의미
+- 매 `logging_steps`마다 기록되며, **배치 단위의 순간 loss**이므로 노이즈가 있음
+- 전체 학습 경향은 이동 평균으로 보는 게 정확하다
+- **단독으로는 과적합 판단 불가** — 반드시 eval_loss 또는 eval_wer와 함께 봐야 함
+
+#### grad_norm (Gradient Norm)
+
+**현재 스텝에서 모든 학습 파라미터의 gradient 벡터 크기 (L2 norm)**
+
+```
+grad_norm = √( Σ ||∇W_i||² )   (모든 레이어의 gradient를 이어 붙인 벡터의 크기)
+```
+
+- **크다** → 파라미터가 빠르게 변해야 한다는 신호 (손실 지형이 가파름)
+- **작다** → 파라미터 변화가 미미함 (수렴 중이거나 평탄한 지형)
+- `max_grad_norm=1.0` 설정 시 이 값이 1.0을 넘으면 **gradient clipping** 적용:
+  ```
+  실제 적용 gradient = gradient × (1.0 / grad_norm)   if grad_norm > 1.0
+  ```
+  로그에 찍히는 grad_norm은 **클리핑 전 원본 값**이므로, 이 값이 줄어드는 것은 모델이 수렴 중이라는 의미
+
+---
 
 ### 세 메트릭의 동역학
 
@@ -89,6 +166,44 @@
 7.38 → 4.97 → 4.01 → 3.90 → 3.79 → 3.71 → ... → 3.49
 가파른 감소  ─────────  완만한 감소  ─────────────  평탄화
 ```
+
+---
+
+### 메트릭 변화 패턴과 과적합 신호 감지
+
+학습 상태는 train_loss, eval_loss(또는 eval_wer), grad_norm 세 가지를 **조합**해서 판단한다.
+
+#### 패턴 분류표
+
+| 패턴 | train_loss | eval_loss | grad_norm | 해석 |
+|---|---|---|---|---|
+| **정상 학습** | ↓ | ↓ | 점진적 안정 | 모델이 일반화 가능한 패턴을 학습 중 |
+| **과적합 초기** | ↓ | → 또는 ↑ | 낮고 안정 | 훈련 데이터 외우기 시작 |
+| **과적합 심화** | ↓↓ | ↑↑ | 낮고 안정 | 완전한 과적합, 즉시 중단 필요 |
+| **학습률 과대** | 진동 | 진동 | 크고 불안정 | lr이 너무 높음, lr을 낮춰야 함 |
+| **학습 정체** | → | → | 매우 작음 | 수렴 완료 또는 local minimum 진입 |
+| **gradient 폭발** | 급등 또는 NaN | - | 갑자기 매우 큼 | lr 과대 또는 초기화 문제 |
+| **gradient 소실** | 거의 안 변함 | 거의 안 변함 | 거의 0 | 깊은 층에 gradient가 전달 안 됨 |
+
+#### 이번 학습에서 실제로 나타난 신호
+
+```
+Epoch 1~4:  train_loss ↓↓  eval_wer ↓↓  grad_norm 4.37→1.87  → 정상 학습
+Epoch 5~7:  train_loss ↓   eval_wer ↓   grad_norm 1.90→1.60  → 수렴 진입
+Epoch 8:    train_loss ↓   eval_wer ↑   grad_norm 1.69        → ⚠️ 과적합 초기
+```
+
+특이사항: eval_loss(1.727→1.726)는 미세하게 줄었지만 **eval_wer(26.12%→26.27%)는 반등**. loss 감소가 실제 성능 개선으로 이어지지 않는 단계임을 의미하므로, **primary metric은 task 지표(WER)로 설정하는 것이 중요**.
+
+#### 조기 개입 기준 (실무 가이드)
+
+| 조건 | 권장 조치 |
+|---|---|
+| eval_loss가 2 epoch 연속 증가 | Early stopping 발동 (`patience=2`) |
+| eval_wer가 반등 + train_loss는 감소 | Best 체크포인트 저장 후 학습 종료 |
+| grad_norm이 갑자기 5× 이상 급증 | lr 낮추거나 `max_grad_norm` 축소 |
+| train_loss가 NaN | lr을 10× 낮추고 재시작 |
+| grad_norm이 수 epoch 동안 거의 0 | lr 너무 낮거나 모델 구조 문제 확인 |
 
 ---
 
