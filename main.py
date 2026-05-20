@@ -43,6 +43,20 @@ from datasets import DatasetDict, load_from_disk
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 import evaluate
 
+# peft / bitsandbytes는 선택적 의존성 — LoRA/QLoRA 사용 시에만 필요
+try:
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    _PEFT_AVAILABLE = True
+except ImportError:
+    _PEFT_AVAILABLE = False
+
+try:
+    import torch
+    from transformers import BitsAndBytesConfig
+    _BNB_AVAILABLE = True
+except ImportError:
+    _BNB_AVAILABLE = False
+
 logger = get_logger(__name__)
 
 # torchcodec은 FFmpeg 공유 라이브러리가 없거나 PyTorch 버전이 맞지 않으면
@@ -236,10 +250,64 @@ def prepare_datasets_on_the_fly(dsd: DatasetDict, cfg: dict, processor) -> Datas
 # 3단계: 모델 초기화
 # ============================================================
 
+def _build_qlora_bnb_config(lora_cfg: dict):
+    """QLoRA용 BitsAndBytesConfig를 생성한다."""
+    if not _BNB_AVAILABLE:
+        raise ImportError(
+            "QLoRA를 사용하려면 bitsandbytes가 필요합니다.\n"
+            "  pip install bitsandbytes"
+        )
+    dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+    compute_dtype = dtype_map.get(lora_cfg.get("bnb_4bit_compute_dtype", "float16"), torch.float16)
+    return BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_quant_type=lora_cfg.get("bnb_4bit_quant_type", "nf4"),
+        bnb_4bit_use_double_quant=lora_cfg.get("use_double_quant", True),
+    )
+
+
+def _apply_lora(model, lora_cfg: dict):
+    """LoRA 어댑터를 모델에 적용하고 학습 가능 파라미터를 출력한다."""
+    if not _PEFT_AVAILABLE:
+        raise ImportError(
+            "LoRA/QLoRA를 사용하려면 peft가 필요합니다.\n"
+            "  pip install peft"
+        )
+    config = LoraConfig(
+        r=lora_cfg["r"],
+        lora_alpha=lora_cfg["lora_alpha"],
+        target_modules=lora_cfg["target_modules"],
+        lora_dropout=lora_cfg["lora_dropout"],
+        bias="none",
+    )
+    model = get_peft_model(model, config)
+    model.print_trainable_parameters()
+    return model
+
+
 def setup_model(cfg: dict, processor):
-    """Whisper 모델을 초기화하고 generation config를 설정한다."""
+    """
+    Whisper 모델을 초기화하고 generation config를 설정한다.
+
+    lora.mode 설정에 따라 세 가지 방식으로 동작한다:
+      - "full"  : 전체 파라미터 학습 (기존 방식)
+      - "lora"  : LoRA 어댑터만 학습 (peft 필요)
+      - "qlora" : 4비트 양자화 + LoRA 학습 (peft + bitsandbytes 필요)
+    """
     model_cfg = cfg["model"]
-    model = get_model(model_cfg["name"])
+    lora_cfg = cfg.get("lora", {})
+    lora_mode = lora_cfg.get("mode", "full")
+
+    # QLoRA: 4비트 양자화 설정으로 모델 로드
+    if lora_mode == "qlora":
+        bnb_config = _build_qlora_bnb_config(lora_cfg)
+        model = get_model(model_cfg["name"], quantization_config=bnb_config)
+        model = prepare_model_for_kbit_training(
+            model, use_gradient_checkpointing=True
+        )
+    else:
+        model = get_model(model_cfg["name"])
 
     # 추론/평가 시 디코더 설정
     # forced_decoder_ids는 generate()가 내부에서도 생성하므로 중복 경고 방지를 위해 None으로 설정
@@ -258,6 +326,10 @@ def setup_model(cfg: dict, processor):
     # decoder_start_token_id 설정
     sot_id = tok.convert_tokens_to_ids("<|startoftranscript|>")
     model.config.decoder_start_token_id = sot_id
+
+    # LoRA / QLoRA: 어댑터 적용
+    if lora_mode in ("lora", "qlora"):
+        model = _apply_lora(model, lora_cfg)
 
     return model
 
@@ -389,6 +461,9 @@ if __name__ == '__main__':
 
     # ── 3단계: 모델 초기화 및 학습 ──────────────────────────────────
     if "train" in steps:
+        lora_cfg = cfg.get("lora", {})
+        lora_mode = lora_cfg.get("mode", "full")
+
         # DataLoader가 학습 중 오디오를 재디코딩하지 않도록 원본 컬럼 제거
         # (전처리 결과인 input_features, labels 만 남김)
         drop_cols = [c for c in ["audio", "sentence"] if c in train_dataset.column_names]
@@ -404,6 +479,10 @@ if __name__ == '__main__':
         _log_model_info(model)
 
         logger.info("학습 설정:")
+        logger.info(f"  파인튜닝 모드 : {lora_mode.upper()}")
+        if lora_mode in ("lora", "qlora"):
+            logger.info(f"  LoRA rank     : {lora_cfg['r']}  /  alpha: {lora_cfg['lora_alpha']}")
+            logger.info(f"  target_modules: {lora_cfg['target_modules']}")
         logger.info(f"  에폭          : {train_cfg['num_epochs']}")
         logger.info(f"  배치 크기     : {train_cfg['train_batch_size']} "
                     f"(유효: {train_cfg['train_batch_size'] * train_cfg['gradient_accumulation_steps']})")
@@ -414,6 +493,10 @@ if __name__ == '__main__':
             processor=processor,
             decoder_start_token_id=model.config.decoder_start_token_id,
         )
+
+        # QLoRA는 4비트 양자화 모델이므로 fp16을 비활성화해야 한다.
+        # (양자화 모델에서 fp16 mixed precision은 충돌 발생)
+        use_fp16 = train_cfg.get("fp16", True) and (lora_mode != "qlora")
 
         training_args = Seq2SeqTrainingArguments(
             output_dir=train_cfg["output_dir"],
@@ -442,7 +525,7 @@ if __name__ == '__main__':
             dataloader_prefetch_factor=None,
             dataloader_persistent_workers=False,
             remove_unused_columns=False,
-            fp16=train_cfg.get("fp16", True),
+            fp16=use_fp16,
             seed=train_cfg.get("seed", 42),
         )
 
@@ -459,7 +542,16 @@ if __name__ == '__main__':
         with log_step(logger, "3단계: 학습"):
             trainer.train()
 
+        # LoRA / QLoRA: 어댑터 가중치만 별도 저장
+        # (체크포인트에는 이미 어댑터가 저장되지만, 최종본을 명시적으로 저장)
+        if lora_mode in ("lora", "qlora"):
+            adapter_dir = Path(train_cfg["output_dir"]) / "final_adapter"
+            model.save_pretrained(str(adapter_dir))
+            logger.info(f"LoRA 어댑터 저장 완료: {adapter_dir}")
+            logger.info("  (추론 시 원본 모델과 병합: PeftModel.from_pretrained() → merge_and_unload())")
+
         logger.info("=" * 60)
         logger.info("파인튜닝 완료")
-        logger.info(f"체크포인트 저장 경로: {train_cfg['output_dir']}")
+        logger.info(f"파인튜닝 모드   : {lora_mode.upper()}")
+        logger.info(f"체크포인트 경로 : {train_cfg['output_dir']}")
         logger.info("=" * 60)

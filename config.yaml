@@ -66,6 +66,27 @@ preprocessing:
   max_target_len: null           # 토큰 길이 제한 (null이면 무제한)
   truncation: true
 
+# --- LoRA / QLoRA 설정 ---
+lora:
+  mode: "lora"               # "full" (전체 파라미터), "lora", "qlora"
+
+  # LoRA / QLoRA 공통 파라미터
+  r: 32                      # 랭크: 클수록 학습 파라미터 ↑ (8~64 권장)
+  lora_alpha: 64             # 스케일링 계수 (보통 r * 2)
+  lora_dropout: 0.05         # 드롭아웃 (과적합 방지, 0.0~0.1)
+  target_modules:            # LoRA를 적용할 Whisper 레이어
+    - "q_proj"
+    - "v_proj"
+    - "k_proj"
+    - "out_proj"
+    - "fc1"
+    - "fc2"
+
+  # QLoRA 전용 파라미터 (mode: "qlora" 일 때만 사용)
+  bnb_4bit_compute_dtype: "float16"   # 연산 정밀도 ("float16" 또는 "bfloat16")
+  bnb_4bit_quant_type: "nf4"          # 양자화 방식 ("nf4" 또는 "fp4")
+  use_double_quant: true              # 이중 양자화 (추가 메모리 절약)
+
 # --- 학습 설정 ---
 training:
   output_dir: "./checkpoints/whisper-tiny-en"

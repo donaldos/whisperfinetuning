@@ -13,6 +13,7 @@ logger = get_logger(__name__)
 
 VALID_SOURCES = {"local", "huggingface"}
 VALID_AUG_MODES = {"offline", "on_the_fly"}
+VALID_LORA_MODES = {"full", "lora", "qlora"}
 
 
 def load_config(config_path: str = "config.yaml") -> dict:
@@ -43,7 +44,7 @@ def load_config(config_path: str = "config.yaml") -> dict:
 
 def _validate(cfg: dict):
     """필수 섹션과 키의 존재 여부, 값의 유효성을 검증한다."""
-    for section in ("data", "augmentation", "model", "preprocessing", "training"):
+    for section in ("data", "augmentation", "model", "preprocessing", "training", "lora"):
         if section not in cfg:
             raise ValueError(f"설정 파일에 '{section}' 섹션이 없습니다.")
 
@@ -59,3 +60,15 @@ def _validate(cfg: dict):
     aug_mode = cfg["augmentation"].get("mode")
     if aug_mode not in VALID_AUG_MODES:
         raise ValueError(f"augmentation.mode는 {VALID_AUG_MODES} 중 하나여야 합니다. 현재: '{aug_mode}'")
+
+    lora_mode = cfg["lora"].get("mode")
+    if lora_mode not in VALID_LORA_MODES:
+        raise ValueError(f"lora.mode는 {VALID_LORA_MODES} 중 하나여야 합니다. 현재: '{lora_mode}'")
+
+    if lora_mode in ("lora", "qlora"):
+        lora_cfg = cfg["lora"]
+        for key in ("r", "lora_alpha", "lora_dropout", "target_modules"):
+            if key not in lora_cfg:
+                raise ValueError(f"lora.mode가 '{lora_mode}'이면 lora.{key} 가 필요합니다.")
+        if not isinstance(lora_cfg["target_modules"], list) or len(lora_cfg["target_modules"]) == 0:
+            raise ValueError("lora.target_modules는 비어있지 않은 리스트여야 합니다.")

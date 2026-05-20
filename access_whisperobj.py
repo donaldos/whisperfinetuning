@@ -115,7 +115,7 @@ def get_processor(modelsname: str, langcode: str, task: str) -> Tuple[bool, Unio
         return False, f"{e}"
 
 
-def get_model(model_name: str):
+def get_model(model_name: str, quantization_config=None):
     """
     Whisper 사전학습 모델을 로드한다.
 
@@ -126,11 +126,16 @@ def get_model(model_name: str):
     Args:
         model_name: HuggingFace 모델 ID (예: "openai/whisper-tiny") 또는
                     로컬 경로 (예: "model/whisper-tiny")
+        quantization_config: BitsAndBytesConfig 객체 (QLoRA 사용 시 전달, 기본값 None)
 
     Returns:
         WhisperForConditionalGeneration: 사전학습 가중치가 로드된 Whisper 모델
     """
-    return WhisperForConditionalGeneration.from_pretrained(model_name)
+    kwargs = {}
+    if quantization_config is not None:
+        kwargs["quantization_config"] = quantization_config
+        kwargs["device_map"] = "auto"
+    return WhisperForConditionalGeneration.from_pretrained(model_name, **kwargs)
 
 
 def get_trainer_args(argfilepath: str):

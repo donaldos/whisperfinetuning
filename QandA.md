@@ -1083,6 +1083,167 @@ training:
 
 ---
 
+## Q19. 전체 파라미터 파인튜닝 대신 LoRA / QLoRA를 적용할 수 있는가?
+
+### A. config.yaml의 `lora.mode`를 변경하는 것만으로 Full / LoRA / QLoRA 세 가지 방식을 선택할 수 있다.
+
+#### 세 방식 비교
+
+| 방식 | 학습 파라미터 | GPU 메모리 (whisper-tiny 기준) | 설치 필요 패키지 |
+|------|-------------|-------------------------------|----------------|
+| **Full Fine-tuning** | 39M (100%) | ~2.5 GB | 없음 (현재 방식) |
+| **LoRA** | ~3.7M (9.5%) | ~1.5 GB | `peft` |
+| **QLoRA** | ~3.7M (9.5%) | ~0.8 GB | `peft` + `bitsandbytes` |
+
+```
+pip install peft              # LoRA 사용 시
+pip install bitsandbytes      # QLoRA 추가 시
+```
+
+#### config.yaml 설정
+
+```yaml
+lora:
+  mode: "full"               # "full" | "lora" | "qlora" 중 하나 선택
+
+  # LoRA / QLoRA 공통 파라미터
+  r: 32                      # 랭크: 클수록 학습 파라미터 ↑ (8~64 권장)
+  lora_alpha: 64             # 스케일링 계수 (보통 r * 2)
+  lora_dropout: 0.05         # 드롭아웃 (과적합 방지, 0.0~0.1)
+  target_modules:            # LoRA를 적용할 Whisper 레이어
+    - "q_proj"
+    - "v_proj"
+    - "k_proj"
+    - "out_proj"
+    - "fc1"
+    - "fc2"
+
+  # QLoRA 전용 파라미터
+  bnb_4bit_compute_dtype: "float16"
+  bnb_4bit_quant_type: "nf4"
+  use_double_quant: true
+```
+
+#### LoRA 원리
+
+LoRA(Low-Rank Adaptation)는 기존 가중치 행렬을 고정(freeze)하고, 저랭크(low-rank) 행렬 두 개(A, B)만 학습하는 방식이다.
+
+```
+기존 방식 (Full Fine-tuning):
+  W_new = W_pretrained + ΔW     # ΔW는 W와 동일한 크기 (예: 512×512 = 262,144 파라미터)
+
+LoRA:
+  W_new = W_pretrained + B × A  # A: (r×512), B: (512×r), r=32 → 512×32×2 = 32,768 파라미터
+  ↑ 고정 (학습 안 함)  ↑ 이 부분만 학습 (전체의 12.5%)
+```
+
+랭크 `r`이 작을수록 파라미터 절약이 크고, 클수록 표현력이 높아진다.
+
+#### QLoRA 원리
+
+QLoRA는 LoRA에 4비트 양자화를 추가한 방식이다.
+
+```
+기존 모델 가중치: FP32 (32비트)
+QLoRA 모델 가중치: NF4 (4비트) ← 메모리 8분의 1
+연산: 4비트 → FP16으로 dequantize → 연산 → 다시 4비트 저장
+LoRA 어댑터: FP16으로 학습 (양자화 없음)
+```
+
+```
+모델 메모리: 39M × 4bit = ~20MB (기존 FP32: 39M × 32bit = ~150MB)
+```
+
+#### Whisper에서 LoRA를 적용하는 레이어
+
+```
+Whisper 구조
+  ├── Encoder (음성 → 표현)
+  │     └── 각 레이어: Self-Attention (q/k/v/out_proj) + FFN (fc1/fc2)
+  └── Decoder (표현 → 텍스트)
+        └── 각 레이어: Self-Attention + Cross-Attention (q/k/v/out_proj) + FFN (fc1/fc2)
+
+LoRA 적용 대상 (target_modules):
+  "q_proj", "v_proj"  ← Query/Value 행렬 (가장 중요, 많은 연구에서 이것만으로도 효과)
+  "k_proj", "out_proj" ← Key/Output 행렬
+  "fc1", "fc2"         ← Feed-Forward Network (추가하면 파라미터 ↑, 성능 ↑)
+```
+
+#### 파이프라인 흐름 변화
+
+**Full Fine-tuning (기존):**
+```
+get_model() → generation_config 설정 → Seq2SeqTrainer 학습
+→ checkpoints/에 전체 모델 저장 (~150MB)
+```
+
+**LoRA:**
+```
+get_model() → generation_config 설정 → get_peft_model() → Seq2SeqTrainer 학습
+→ checkpoints/에 어댑터만 저장 (~2MB)
+→ final_adapter/에 최종 어댑터 저장
+```
+
+**QLoRA:**
+```
+get_model(quantization_config=BitsAndBytesConfig(4bit)) → prepare_model_for_kbit_training()
+→ generation_config 설정 → get_peft_model() → Seq2SeqTrainer 학습 (fp16 비활성화)
+→ checkpoints/에 어댑터만 저장 (~2MB)
+→ final_adapter/에 최종 어댑터 저장
+```
+
+#### 학습 후 저장 구조
+
+```
+checkpoints/whisper-tiny-en/
+  ├── checkpoint-95/          # 스텝별 체크포인트 (어댑터 가중치만)
+  ├── checkpoint-190/
+  └── final_adapter/          # 최종 어댑터 (LoRA/QLoRA 시에만 생성)
+        ├── adapter_config.json
+        └── adapter_model.safetensors   # ~2MB (전체 모델 대비 1% 크기)
+```
+
+#### 학습 후 추론 시 모델 병합
+
+```python
+from transformers import WhisperForConditionalGeneration
+from peft import PeftModel
+
+# 방법 1: 어댑터를 분리된 상태로 사용 (메모리 효율적)
+base_model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+model = PeftModel.from_pretrained(base_model, "checkpoints/whisper-tiny-en/final_adapter")
+
+# 방법 2: 원본 모델에 병합 (추론 속도 동일, 배포 용이)
+model = model.merge_and_unload()
+```
+
+#### QLoRA 사용 시 주의사항
+
+| 항목 | 내용 |
+|------|------|
+| fp16 | QLoRA 사용 시 자동으로 비활성화됨 (4비트 모델과 충돌) |
+| GPU | CUDA GPU 필수 (CPU는 bitsandbytes 미지원) |
+| 저장 | 체크포인트에 양자화된 기본 모델은 저장되지 않음 (어댑터만 저장) |
+| 추론 | 병합 후 추론 시 원본 모델을 다시 로드해야 함 |
+
+#### 어떤 방식을 선택할까?
+
+```
+GPU 메모리 충분 (8GB+) + 소규모 데이터  → LoRA   (과적합 방지 + 빠름)
+GPU 메모리 부족 (4GB 이하)             → QLoRA  (대형 모델도 단일 GPU에서 가능)
+대규모 데이터 + 충분한 GPU 자원         → Full   (최대 성능)
+whisper-large-v3 같은 대형 모델        → QLoRA  (단일 GPU에서 유일한 실용적 선택)
+```
+
+#### 구현 위치
+
+- `config.yaml`: `lora` 섹션 추가 (`mode`, `r`, `lora_alpha`, `target_modules` 등)
+- `config_loader.py`: `lora.mode` 유효성 검증 및 필수 키 확인 추가
+- `access_whisperobj.py`: `get_model()`에 `quantization_config` 파라미터 추가 (QLoRA용)
+- `main.py`: `_build_qlora_bnb_config()`, `_apply_lora()` 함수 추가, `setup_model()` 수정, 학습 후 어댑터 저장 로직 추가
+
+---
+
 ## Q18. `num_epochs`, `train_batch_size`, `gradient_accumulation_steps`의 관계는?
 
 ### A. 세 파라미터가 결합되어 실제 가중치 업데이트 횟수(총 optimizer steps)가 결정된다.
