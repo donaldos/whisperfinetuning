@@ -7,9 +7,14 @@ augumented_audio.py - 오디오 데이터 증강 모듈
   2. Volume Perturbation: 볼륨을 랜덤하게 변경 (-6dB ~ +6dB)
   3. Noise Injection: SNR 기반으로 배경 노이즈를 혼합 (5~20dB)
   4. Reverb (RIR Convolution): Room Impulse Response로 잔향/울림 효과 시뮬레이션
+  5. SpecAugment: log-mel 스펙트로그램에 주파수/시간 마스킹 적용
 
 각 증강은 독립적으로 확률 기반으로 적용되며, 여러 기법이 동시에 적용될 수 있다.
 config.yaml의 augmentation 섹션에서 개별 활성화/비활성화 및 파라미터 조정 가능.
+
+기법별 처리 도메인:
+  - Speed / Volume / Noise / Reverb : 파형(waveform) 도메인 — log-mel 변환 이전
+  - SpecAugment                      : 스펙트로그램 도메인  — log-mel 변환 이후
 """
 
 import random
@@ -464,6 +469,63 @@ def make_eval_transform(processor):
         return result
 
     return transform
+
+
+def apply_spec_augment(
+    features: torch.Tensor,
+    freq_mask_param: int = 27,
+    time_mask_param: int = 100,
+    num_freq_masks: int = 2,
+    num_time_masks: int = 2,
+) -> torch.Tensor:
+    """
+    SpecAugment: log-mel 스펙트로그램에 주파수 마스킹과 시간 마스킹을 적용한다.
+
+    원리:
+      - Frequency Masking: mel 주파수 축(0~79)의 연속 f개 bin을 0으로 마스킹
+      - Time Masking: 시간 축의 연속 t개 프레임을 0으로 마스킹
+      마스킹 값(0)은 log-mel 정규화 후 무음에 해당하는 값이다.
+
+    적용 위치:
+      DataCollatorSpeechSeq2SeqWithPadding.__call__() 내부에서 호출되며,
+      학습 시에만 적용되고 평가 시에는 비활성화된다.
+
+    Args:
+        features : (batch, freq, time) 형태의 log-mel 텐서
+                   batch=배치 크기, freq=80(mel bins), time=최대 3000 프레임
+        freq_mask_param : 주파수 마스킹 최대 폭 (mel bins, 최대 80)
+                          권장값: 27 (전체 80bins의 약 1/3)
+        time_mask_param : 시간 마스킹 최대 폭 (프레임 수)
+                          권장값: 100 (30초 기준 3000프레임의 약 3%)
+        num_freq_masks  : 주파수 마스킹 반복 횟수 (독립적으로 적용)
+        num_time_masks  : 시간 마스킹 반복 횟수 (독립적으로 적용)
+
+    Returns:
+        마스킹이 적용된 features 텐서 (shape 동일)
+    """
+    features = features.clone()
+    batch_size, freq_size, time_size = features.shape
+
+    for i in range(batch_size):
+        # --- 주파수 마스킹 (Frequency Masking) ---
+        # mel 주파수 축에서 f개 연속 bin을 무음(0)으로 마스킹
+        for _ in range(num_freq_masks):
+            f = random.randint(0, freq_mask_param)
+            if f == 0 or freq_size <= f:
+                continue
+            f0 = random.randint(0, freq_size - f)
+            features[i, f0:f0 + f, :] = 0.0
+
+        # --- 시간 마스킹 (Time Masking) ---
+        # 시간 축에서 t개 연속 프레임을 무음(0)으로 마스킹
+        for _ in range(num_time_masks):
+            t = random.randint(0, min(time_mask_param, time_size))
+            if t == 0 or time_size <= t:
+                continue
+            t0 = random.randint(0, time_size - t)
+            features[i, :, t0:t0 + t] = 0.0
+
+    return features
 
 
 def augment_example(example):

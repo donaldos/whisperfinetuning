@@ -51,6 +51,15 @@ augmentation:
     prob: 0.3                    # 적용 확률 (잔향은 과도하면 인식률 저하 → 0.2~0.4 권장)
     rir_dir: "/path/to/rir_wavs" # RIR wav 파일 디렉토리 (OpenSLR-28 등)
 
+  # SpecAugment: log-mel 스펙트로그램 도메인 증강 (파형 증강과 독립적으로 동작)
+  # 학습 시에만 적용되며, 평가/테스트 시에는 자동으로 비활성화됨
+  specaugment:
+    enabled: true
+    freq_mask_param: 27          # 주파수 마스킹 최대 폭 (mel bins, 최대 80)
+    time_mask_param: 100         # 시간 마스킹 최대 폭 (프레임 수)
+    num_freq_masks: 2            # 주파수 마스킹 반복 횟수
+    num_time_masks: 2            # 시간 마스킹 반복 횟수
+
 # --- 모델 설정 ---
 model:
   name: "openai/whisper-tiny"

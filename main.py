@@ -43,6 +43,27 @@ from datasets import DatasetDict, load_from_disk
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 import evaluate
 
+
+class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
+    """
+    SpecAugment를 학습/평가 단계에서 자동으로 전환하는 커스텀 Trainer.
+
+    DataCollator의 apply_spec_augment 플래그를 단계별로 제어한다:
+      - 학습(train DataLoader 생성 시): True  → SpecAugment 적용
+      - 평가(eval DataLoader 생성 시) : False → SpecAugment 비활성화
+
+    num_workers=0(메인 프로세스 단일 실행) 환경에서 DataLoader가
+    배치를 순차적으로 생성하므로 플래그 전환이 정확하게 동작한다.
+    """
+
+    def get_train_dataloader(self):
+        self.data_collator.apply_spec_augment = True
+        return super().get_train_dataloader()
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        self.data_collator.apply_spec_augment = False
+        return super().get_eval_dataloader(eval_dataset)
+
 # peft / bitsandbytes는 선택적 의존성 — LoRA/QLoRA 사용 시에만 필요
 try:
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
@@ -489,9 +510,20 @@ if __name__ == '__main__':
         logger.info(f"  학습률        : {train_cfg['learning_rate']}")
         logger.info(f"  출력 디렉토리 : {train_cfg['output_dir']}")
 
+        # SpecAugment 설정: enabled=true이고 학습 단계가 포함된 경우만 활성화
+        sa_cfg = cfg.get("augmentation", {}).get("specaugment", {})
+        spec_augment_cfg = sa_cfg if sa_cfg.get("enabled", False) else None
+        if spec_augment_cfg:
+            logger.info(
+                f"  SpecAugment 활성화: freq_mask={sa_cfg['freq_mask_param']}bins × "
+                f"{sa_cfg['num_freq_masks']}회, "
+                f"time_mask={sa_cfg['time_mask_param']}frames × {sa_cfg['num_time_masks']}회"
+            )
+
         data_collator = DataCollatorSpeechSeq2SeqWithPadding(
             processor=processor,
             decoder_start_token_id=model.config.decoder_start_token_id,
+            spec_augment_cfg=spec_augment_cfg,
         )
 
         # QLoRA는 4비트 양자화 모델이므로 fp16을 비활성화해야 한다.
@@ -529,7 +561,7 @@ if __name__ == '__main__':
             seed=train_cfg.get("seed", 42),
         )
 
-        trainer = Seq2SeqTrainer(
+        trainer = WhisperSeq2SeqTrainer(
             args=training_args,
             model=model,
             train_dataset=train_dataset,

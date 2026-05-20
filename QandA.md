@@ -1083,6 +1083,125 @@ training:
 
 ---
 
+## Q20. 스펙트럼 관련 증강 기법(SpecAugment)을 적용할 수 있는가?
+
+### A. 기존 파형 증강과 별개로 SpecAugment가 추가되었으며, config.yaml에서 독립적으로 제어한다.
+
+#### 기존 증강과의 처리 도메인 비교
+
+| 기법 | 처리 도메인 | 적용 시점 |
+|------|-----------|---------|
+| Speed Perturbation | **파형** (시간축 리샘플링) | log-mel 변환 이전 |
+| Volume Perturbation | **파형** (진폭 스케일링) | log-mel 변환 이전 |
+| Noise Injection | **파형** (SNR 기반 혼합) | log-mel 변환 이전 |
+| Reverb (RIR) | **파형** (FFT 컨볼루션) | log-mel 변환 이전 |
+| **SpecAugment** | **스펙트로그램** (마스킹) | log-mel 변환 이후 |
+
+#### SpecAugment 원리
+
+log-mel 스펙트로그램의 주파수 축(mel bins)과 시간 축(frames)에 연속 구간을 무음(0)으로 마스킹한다.
+
+```
+log-mel spectrogram (80 mel bins × 3000 frames)
+
+주파수 축 (Frequency Masking):
+  mel bin 0  ───────────────────────────────────
+  mel bin 10 ──────── [████████████] ────────────  ← f=12 bins 마스킹
+  mel bin 22 ───────────────────────────────────
+  ...
+  mel bin 79 ───────────────────────────────────
+
+시간 축 (Time Masking):
+  모든 bin    ────────── [████] ────────────────  ← t=80 frames 마스킹
+```
+
+마스킹 값(0)은 log-mel 정규화 후 무음에 해당하므로, 모델이 해당 구간을 "들을 수 없는" 상태로 학습하여 강건성이 향상된다.
+
+#### config.yaml 설정
+
+```yaml
+augmentation:
+  specaugment:
+    enabled: true
+    freq_mask_param: 27          # 주파수 마스킹 최대 폭 (mel bins, 최대 80)
+    time_mask_param: 100         # 시간 마스킹 최대 폭 (프레임 수)
+    num_freq_masks: 2            # 주파수 마스킹 반복 횟수
+    num_time_masks: 2            # 시간 마스킹 반복 횟수
+```
+
+#### 파라미터 가이드
+
+| 파라미터 | 의미 | 권장값 | 주의 |
+|---------|------|--------|------|
+| `freq_mask_param` | 주파수 마스킹 최대 폭 | 27 (전체 80의 34%) | 40 이상이면 과도한 정보 손실 |
+| `time_mask_param` | 시간 마스킹 최대 폭 | 100 (3000프레임의 3%) | 200 이상이면 WER 저하 |
+| `num_freq_masks` | 주파수 마스킹 횟수 | 2 | 독립적으로 반복 적용 |
+| `num_time_masks` | 시간 마스킹 횟수 | 2 | 독립적으로 반복 적용 |
+
+#### 파이프라인 내 적용 위치
+
+```
+오디오 파형
+  ↓ [파형 증강: Speed / Volume / Reverb / Noise]   ← augumented_audio.py
+  ↓ processor() → log-mel spectrogram (80 × T)      ← WhisperProcessor
+  ↓ DataCollatorSpeechSeq2SeqWithPadding.pad()       ← preprocess_datasetdict_batch.py
+  ↓ [SpecAugment: 주파수/시간 마스킹]  ← 학습 시에만 apply_spec_augment=True
+  ↓ 모델 (Whisper Encoder)
+```
+
+#### 학습/평가 자동 전환
+
+SpecAugment는 **학습 시에만** 적용되어야 한다. 평가 데이터에 마스킹하면 WER이 실제보다 높게 측정된다.
+
+이를 위해 `WhisperSeq2SeqTrainer`가 DataLoader 생성 시점에 플래그를 자동 전환한다:
+
+```python
+class WhisperSeq2SeqTrainer(Seq2SeqTrainer):
+    def get_train_dataloader(self):
+        self.data_collator.apply_spec_augment = True   # 학습: SpecAugment 켜짐
+        return super().get_train_dataloader()
+
+    def get_eval_dataloader(self, eval_dataset=None):
+        self.data_collator.apply_spec_augment = False  # 평가: SpecAugment 꺼짐
+        return super().get_eval_dataloader(eval_dataset)
+```
+
+`dataloader_num_workers=0` (메인 프로세스 단일 실행) 환경에서 DataLoader가 배치를 순차적으로 생성하므로 플래그 전환이 정확하게 동작한다.
+
+#### 기존 파형 증강과의 조합 효과
+
+```
+파형 증강(Speed/Noise/Reverb) + SpecAugment 조합 시:
+
+  원본: "안녕하세요" 음성
+  → Speed 0.95x 적용 (약간 느림)
+  → 배경 노이즈 SNR=10dB 혼합
+  → log-mel 변환
+  → 주파수 bin 15~27 마스킹 (고주파 일부 손실)
+  → 시간 프레임 500~580 마스킹 (특정 구간 손실)
+  → 모델 학습
+
+두 도메인에서 독립적으로 작용하므로 상호 보완적이다.
+```
+
+#### offline 모드 vs on_the_fly 모드에서의 동작
+
+| 모드 | 파형 증강 | SpecAugment |
+|------|---------|-------------|
+| `offline` | 사전 적용 후 디스크 저장 | DataCollator에서 **매 배치마다** 랜덤 적용 |
+| `on_the_fly` | 매 샘플 접근 시 적용 | DataCollator에서 **매 배치마다** 랜덤 적용 |
+
+SpecAugment는 두 모드 모두에서 DataCollator에서 동일하게 동작한다. offline 모드에서도 에폭마다 다른 마스킹 패턴이 적용되는 효과를 얻을 수 있다.
+
+#### 구현 위치
+
+- `augumented_audio.py`: `apply_spec_augment()` 함수 추가
+- `config.yaml`: `augmentation.specaugment` 섹션 추가
+- `preprocess_datasetdict_batch.py`: `DataCollatorSpeechSeq2SeqWithPadding`에 `spec_augment_cfg`, `apply_spec_augment` 필드 및 적용 로직 추가
+- `main.py`: `WhisperSeq2SeqTrainer` 서브클래스 추가, DataCollator에 `spec_augment_cfg` 전달
+
+---
+
 ## Q19. 전체 파라미터 파인튜닝 대신 LoRA / QLoRA를 적용할 수 있는가?
 
 ### A. config.yaml의 `lora.mode`를 변경하는 것만으로 Full / LoRA / QLoRA 세 가지 방식을 선택할 수 있다.

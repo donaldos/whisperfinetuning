@@ -230,16 +230,23 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
     처리 과정:
       1. input_features(log-mel): feature_extractor.pad()로 패딩
-      2. labels(토큰 ID): tokenizer.pad()로 패딩 → 패딩 위치를 -100으로 마스킹
-      3. decoder_input_ids: labels를 right-shift하여 생성
+      2. (선택) SpecAugment: 주파수/시간 마스킹 적용 (학습 시에만)
+      3. labels(토큰 ID): tokenizer.pad()로 패딩 → 패딩 위치를 -100으로 마스킹
+      4. decoder_input_ids: labels를 right-shift하여 생성
          [<|startoftranscript|>] + labels[:-1]
 
     Attributes:
         processor: WhisperProcessor (feature_extractor + tokenizer 포함)
         decoder_start_token_id: 디코더 시작 토큰 ID (<|startoftranscript|>)
+        spec_augment_cfg: config.yaml의 augmentation.specaugment 딕셔너리
+                          None이면 SpecAugment 비활성화
+        apply_spec_augment: True일 때만 SpecAugment 적용 (학습/평가 전환용 플래그)
+                            WhisperSeq2SeqTrainer가 단계별로 자동 전환
     """
     processor: Any                      # WhisperProcessor
     decoder_start_token_id: int         # 디코더 시작 토큰 (반드시 외부에서 주입)
+    spec_augment_cfg: Optional[dict] = None  # SpecAugment 설정 (None이면 비활성화)
+    apply_spec_augment: bool = True     # 학습=True / 평가=False (Trainer가 자동 전환)
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         """
@@ -257,7 +264,19 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         input_features = [{"input_features": f["input_features"]} for f in features]
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
-        # --- 2) 텍스트 라벨 → 패딩 후 -100 마스킹 ---
+        # --- 2) SpecAugment: 주파수/시간 마스킹 (학습 시에만) ---
+        # 패딩 완료 후 텐서 상태(batch, 80, time)에서 적용
+        if self.apply_spec_augment and self.spec_augment_cfg is not None:
+            from augumented_audio import apply_spec_augment
+            batch["input_features"] = apply_spec_augment(
+                batch["input_features"],
+                freq_mask_param=self.spec_augment_cfg.get("freq_mask_param", 27),
+                time_mask_param=self.spec_augment_cfg.get("time_mask_param", 100),
+                num_freq_masks=self.spec_augment_cfg.get("num_freq_masks", 2),
+                num_time_masks=self.spec_augment_cfg.get("num_time_masks", 2),
+            )
+
+        # --- 3) 텍스트 라벨 → 패딩 후 -100 마스킹 ---
         # torch Tensor면 list로 변환 (tokenizer.pad()가 list를 기대)
         def to_list_ids(x):
             return x.tolist() if isinstance(x, torch.Tensor) else x
@@ -271,7 +290,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         # → CrossEntropyLoss가 해당 위치를 loss 계산에서 자동 제외
         labels = labels.masked_fill(attention_mask.eq(0), -100).to(torch.long)
 
-        # --- 3) decoder_input_ids 생성 (teacher forcing용 shift-right) ---
+        # --- 4) decoder_input_ids 생성 (teacher forcing용 shift-right) ---
         tok = self.processor.tokenizer
         # pad_token이 없으면 eos_token으로 대체 (방어 코드)
         pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
